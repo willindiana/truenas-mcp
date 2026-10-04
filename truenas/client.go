@@ -52,12 +52,51 @@ type Client struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan *responseResult
 
+	// subs maps a subscription collection key ("<name>:<json params>") to its
+	// event channel. Subscription events arrive on the same WebSocket as
+	// request responses but carry a "collection" instead of an "id", so they
+	// bypass the pending map and are fanned out here instead.
+	subsMu sync.Mutex
+	subs   map[string]chan Event
+
 	requestID atomic.Uint64
 }
 
 type responseResult struct {
 	resp *APIResponse
 	err  error
+}
+
+// Event is a single frame delivered to a subscription. Dynamic event sources
+// such as app.container_log_follow emit Msg "added" (and "changed"/"removed"
+// for query-style sources) with a Collection naming the source plus its
+// subscription parameters.
+type Event struct {
+	Msg        string          `json:"msg"`
+	Collection string          `json:"collection"`
+	ID         string          `json:"id,omitempty"`
+	Fields     json.RawMessage `json:"fields,omitempty"`
+	Result     json.RawMessage `json:"result,omitempty"`
+}
+
+// eventBufferSize bounds each subscription channel. readLoop must never block,
+// so a slow consumer drops events rather than stalling the connection. It is
+// sized above the largest tail_lines the app_logs tool will request.
+const eventBufferSize = 8192
+
+// subscriptionKey builds the deterministic collection string that identifies a
+// subscription: the event name followed by its JSON-encoded parameters. Both
+// Subscribe and Unsubscribe derive the key this way so callers do not have to
+// track it.
+func subscriptionKey(name string, params map[string]interface{}) (string, error) {
+	if params == nil {
+		return name, nil
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode subscription params: %w", err)
+	}
+	return name + ":" + string(encoded), nil
 }
 
 type ConnectRequest struct {
@@ -83,6 +122,11 @@ type APIResponse struct {
 	Msg    string          `json:"msg"`
 	Result json.RawMessage `json:"result,omitempty"`
 	Error  *APIError       `json:"error,omitempty"`
+
+	// Collection and Fields are populated on subscription event frames
+	// ("added"/"changed"/"removed"), which carry no request ID.
+	Collection string          `json:"collection,omitempty"`
+	Fields     json.RawMessage `json:"fields,omitempty"`
 }
 
 type APIError struct {
@@ -103,6 +147,7 @@ func NewClient(endpoint, apiKey string, tlsConfig *tls.Config) (*Client, error) 
 		apiKey:    apiKey,
 		tlsConfig: tlsConfig,
 		pending:   make(map[string]chan *responseResult),
+		subs:      make(map[string]chan Event),
 	}, nil
 }
 
@@ -194,6 +239,7 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 		if err := conn.ReadJSON(&resp); err != nil {
 			// Connection dropped - fail all pending requests
 			c.failAllPending(fmt.Errorf("failed to read response: %w", err))
+			c.closeAllSubs()
 
 			// Reset connection state if it's still this connection
 			c.connMu.Lock()
@@ -203,6 +249,12 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 			}
 			c.connMu.Unlock()
 			return
+		}
+
+		// Subscription event frames carry a collection and no request ID, so
+		// they are dispatched to subscribers and never reach the pending map.
+		if resp.Collection != "" && c.dispatchEvent(resp) {
+			continue
 		}
 
 		if debugLogging.Load() {
@@ -229,6 +281,123 @@ func (c *Client) readLoop(conn *websocket.Conn) {
 		} else if resp.ID != "" {
 			log.Printf("Warning: received response for unknown request ID %s (may have timed out)", resp.ID)
 		}
+	}
+}
+
+// dispatchEvent routes a subscription event frame to its subscriber and
+// reports whether it was consumed. Delivery is non-blocking: a full channel
+// means the consumer is not keeping up and the event is dropped rather than
+// stalling readLoop (and with it every concurrent request on this connection).
+func (c *Client) dispatchEvent(resp APIResponse) bool {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+
+	if len(c.subs) == 0 {
+		return false
+	}
+
+	eventName := resp.Collection
+	if idx := strings.Index(eventName, ":"); idx != -1 {
+		eventName = eventName[:idx]
+	}
+
+	// Exact match first; fall back to the event-name prefix so a server that
+	// normalises the echoed params (key order, whitespace) still routes.
+	var ch chan Event
+	if exact, ok := c.subs[resp.Collection]; ok {
+		ch = exact
+	} else {
+		for key, candidate := range c.subs {
+			if strings.HasPrefix(key, eventName+":") || key == eventName {
+				ch = candidate
+				break
+			}
+		}
+	}
+	if ch == nil {
+		return false
+	}
+
+	event := Event{
+		Msg:        resp.Msg,
+		Collection: resp.Collection,
+		ID:         resp.ID,
+		Fields:     resp.Fields,
+		Result:     resp.Result,
+	}
+
+	select {
+	case ch <- event:
+	default:
+		log.Printf("Warning: dropping %s event for %s (subscriber not keeping up)", resp.Msg, eventName)
+	}
+	return true
+}
+
+// Subscribe registers an event subscription against a dynamic event source
+// such as app.container_log_follow and returns a channel delivering its events.
+// Callers must call Unsubscribe with the same name and params when done;
+// otherwise the subscription lives for the life of the connection.
+func (c *Client) Subscribe(name string, params map[string]interface{}) (<-chan Event, error) {
+	key, err := subscriptionKey(name, params)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan Event, eventBufferSize)
+
+	// Register before subscribing so the burst of events that follows a
+	// successful subscribe is not dropped on the floor.
+	c.subsMu.Lock()
+	if existing, ok := c.subs[key]; ok {
+		c.subsMu.Unlock()
+		// Already subscribed: reuse the existing channel rather than leaking
+		// a second server-side subscription.
+		_ = existing
+		return ch, nil
+	}
+	c.subs[key] = ch
+	c.subsMu.Unlock()
+
+	if err := c.unsubscribeKey(key); err != nil {
+		c.subsMu.Lock()
+		delete(c.subs, key)
+		c.subsMu.Unlock()
+		return nil, fmt.Errorf("failed to subscribe to %s: %w", name, err)
+	}
+
+	return ch, nil
+}
+
+// Unsubscribe cancels a subscription created by Subscribe. The channel
+// returned by Subscribe is closed.
+func (c *Client) Unsubscribe(name string, params map[string]interface{}) error {
+	key, err := subscriptionKey(name, params)
+	if err != nil {
+		return err
+	}
+	c.subsMu.Lock()
+	delete(c.subs, key)
+	c.subsMu.Unlock()
+	return c.unsubscribeKey(key)
+}
+
+// unsubscribeKey issues core.unsubscribe for an already-computed collection key.
+func (c *Client) unsubscribeKey(key string) error {
+	if _, err := c.Call("core.subscribe", key); err != nil {
+		return err
+	}
+	return nil
+}
+
+// closeAllSubs drops every subscription and closes its channel. Called when
+// the connection drops, since the server-side subscriptions die with it.
+func (c *Client) closeAllSubs() {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	for key, ch := range c.subs {
+		close(ch)
+		delete(c.subs, key)
 	}
 }
 
