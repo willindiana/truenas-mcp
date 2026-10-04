@@ -1171,6 +1171,53 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 		Handler: handleQueryApps,
 	}
 
+	// List containers for an app
+	r.tools["app_containers"] = Tool{
+		Definition: mcp.Tool{
+			Name:        "app_containers",
+			Description: "List the containers belonging to a TrueNAS app with their service name, state, image and container ID. Works for running, stopped and crashed apps. Use this to find the container_id/service_name needed by app_logs.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"app_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Name of the application (e.g. 'jellyfin-v2', 'immich', 'plane-mcp')",
+					},
+				},
+				"required": []string{"app_name"},
+			},
+		},
+		Handler: handleAppContainers,
+	}
+
+	// Read app container logs
+	r.tools["app_logs"] = Tool{
+		Definition: mcp.Tool{
+			Name:        "app_logs",
+			Description: "Read container logs for a TrueNAS app. Works for RUNNING apps and for CRASHED/STOPPED apps (logs from exited containers are still readable). Returns the last N lines with timestamps, newest last. For a CRASHED app this is the fastest way to see why it died. Pair with query_apps to find crashed apps and app_containers to pick a specific container.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"app_name": map[string]interface{}{
+						"type":        "string",
+						"description": "Name of the application (e.g. 'subgen', 'immich')",
+					},
+					"container": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional: service name (preferred) or container ID prefix. Required only when the app has multiple containers and you want just one. Defaults to all containers.",
+					},
+					"tail_lines": map[string]interface{}{
+						"type":        "integer",
+						"description": "Number of log lines to return per container (default 200, max 5000)",
+						"default":     defaultLogTail,
+					},
+				},
+				"required": []string{"app_name"},
+			},
+		},
+		Handler: handleAppLogs,
+	}
+
 	// Upgrade app
 	r.tools["upgrade_app"] = Tool{
 		Definition: mcp.Tool{
