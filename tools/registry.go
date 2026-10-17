@@ -1703,19 +1703,63 @@ Returns task_id for tracking progress with tasks_get.
 		Handler: r.handleDeleteAppWithDryRun,
 	}
 
-	// Query jobs
-	r.tools["query_jobs"] = Tool{
+	r.tools["app_lifecycle_logs"] = Tool{
 		Definition: mcp.Tool{
-			Name:        "query_jobs",
-			Description: "Query system jobs (running, pending, or completed tasks like replication, snapshots, scrubs, etc.)",
+			Name:        "app_lifecycle_logs",
+			Description: "Read shared /var/log/app_lifecycle.log for ALL apps (not per-app container logs). Requires FULL_ADMIN. Logs may contain secrets; review before sharing. Read-only source; download capped at 16 MiB, output at 1 MiB.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"tail_lines": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
+				},
+				"additionalProperties": false,
+			},
+		},
+		Handler: handleAppLifecycleLogs,
+	}
+
+	// Query jobs
+	r.tools["job_logs"] = Tool{
+		Definition: mcp.Tool{
+			Name:        "job_logs",
+			Description: "Read retained logs for a TrueNAS job (replication, rsync, cloud sync, etc.). Read-only. Returns last tail_lines with truncation indicator; jobs/logs may expire. Download capped at 16 MiB, output at 1 MiB.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"job_id":     map[string]interface{}{"type": "integer", "minimum": 1, "maximum": 2147483647},
+					"tail_lines": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
+				},
+				"required": []string{"job_id"},
+			},
+		},
+		Handler: handleJobLogs,
+	}
+	r.tools["query_replication_tasks"] = Tool{
+		Definition: mcp.Tool{
+			Name:        "query_replication_tasks",
+			Description: "Read replication task settings and current state, including source, destination, transport and retries. Omits SSH credentials and encryption keys. Optional task_id selects one task.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"task_id": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": 2147483647},
+				},
+			},
+		},
+		Handler: handleQueryReplicationTasks,
+	}
+	r.tools["query_jobs"] = Tool{
+		Definition: mcp.Tool{
+			Name:        "query_jobs",
+			Description: "Query retained system jobs. Filter by method (e.g. replication.run) or job_id. State defaults to RUNNING, or all when job_id is supplied. Use job_logs for full retained logs.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"method": map[string]interface{}{"type": "string", "description": "Exact TrueNAS method, e.g. replication.run or rsynctask.run"},
+					"job_id": map[string]interface{}{"type": "integer", "minimum": 1, "maximum": 2147483647},
 					"state": map[string]interface{}{
 						"type":        "string",
 						"enum":        []string{"RUNNING", "WAITING", "SUCCESS", "FAILED", "ABORTED", "all"},
 						"description": "Filter by job state (default: RUNNING)",
-						"default":     "RUNNING",
 					},
 					"limit": map[string]interface{}{
 						"type":        "integer",
@@ -4063,14 +4107,31 @@ func (u *updateAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string]
 }
 
 func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (string, error) {
+	id, err := boundedJobInt(args, "job_id", 0, 2147483647)
+	if err != nil {
+		return "", err
+	}
 	state := "RUNNING"
+	if id != 0 {
+		state = "all"
+	}
+	if value, exists := args["state"]; exists {
+		if _, ok := value.(string); !ok {
+			return "", fmt.Errorf("state must be a string")
+		}
+	}
 	if s, ok := args["state"].(string); ok && s != "" {
 		state = s
 	}
 
-	limit := 50
-	if l, ok := args["limit"].(float64); ok {
-		limit = int(l)
+	switch state {
+	case "RUNNING", "WAITING", "SUCCESS", "FAILED", "ABORTED", "all":
+	default:
+		return "", fmt.Errorf("invalid job state")
+	}
+	limit, err := boundedJobInt(args, "limit", 50, 10000)
+	if err != nil {
+		return "", err
 	}
 
 	// Build query filters based on state
@@ -4084,6 +4145,16 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 	}
 
 	// Build options
+	if id != 0 {
+		filters = append(filters, []interface{}{"id", "=", id})
+	}
+	if value, exists := args["method"]; exists {
+		method, ok := value.(string)
+		if !ok || strings.TrimSpace(method) == "" {
+			return "", fmt.Errorf("method must be a non-empty string")
+		}
+		filters = append(filters, []interface{}{"method", "=", method})
+	}
 	options := map[string]interface{}{
 		"limit":    limit,
 		"order_by": []string{"-time_started"}, // Most recent first
@@ -4110,6 +4181,9 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 		}
 
 		// Add optional fields if present
+		if path, ok := job["logs_path"].(string); ok {
+			jobInfo["logs_available"] = path != ""
+		}
 		if progress, ok := job["progress"]; ok && progress != nil {
 			jobInfo["progress"] = progress
 		}

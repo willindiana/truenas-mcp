@@ -505,6 +505,11 @@ func isSensitiveKey(key string) bool {
 // redactValue returns a deep copy of v with values under sensitive keys masked.
 func redactValue(v interface{}) interface{} {
 	switch t := v.(type) {
+	case string:
+		if strings.Contains(t, "auth_token=") {
+			return "[REDACTED download URL]"
+		}
+		return t
 	case map[string]interface{}:
 		out := make(map[string]interface{}, len(t))
 		for k, val := range t {

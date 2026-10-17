@@ -466,3 +466,29 @@ make test
 # Clean build artifacts
 make clean
 ```
+# Replication diagnostics
+
+Read-only tools for retained TrueNAS job history and replication settings:
+
+- `query_jobs`: optional exact `method` and `job_id` filters. Supplying `job_id`
+  defaults to all states; an explicit `state` still filters results.
+- `job_logs`: required `job_id`, optional `tail_lines` (default 200, maximum 5000).
+  Downloads existing logs through `core.job_download_logs`, using the configured
+  TLS settings. Returns a log tail and `truncated` indicator. Downloads are capped
+  at 16 MiB and output at 1 MiB; larger logs require the TrueNAS UI. No SSH needed.
+- `app_lifecycle_logs`: optional integer `tail_lines` (default 200, range 1–5000).
+  Reads only `/var/log/app_lifecycle.log` via `core.download` with `filesystem.get`
+  (response `[job_id, url]`). This is the shared lifecycle log for **all apps**,
+  not per-app container logs; no `app_name` or arbitrary path is accepted.
+  Requires **FULL_ADMIN**. Source is read-only, but TrueNAS creates a transient
+  download job. Downloads use configured TLS settings, reject external URLs and
+  redirects, and never return download tokens. Download limit: 16 MiB; JSON
+  output limit: 1 MiB. Returns `scope: "all_apps"`, `logs`, and `truncated`.
+  **Logs may contain secrets from any app. Review and redact before sharing.**
+  Verified live read-only against TrueNAS 25.04.1 on 2026-10-17.
+- `query_replication_tasks`: optional `task_id`; returns settings and state,
+  omitting SSH credentials and encryption keys.
+
+Example: call `query_jobs` with `{"method":"replication.run","state":"FAILED"}`,
+then `job_logs` with a returned job ID. History and logs can expire; these tools
+do not provide a permanent archive. Verified against TrueNAS 25.04.1.
