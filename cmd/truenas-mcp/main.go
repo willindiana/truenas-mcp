@@ -86,11 +86,8 @@ func main() {
 	}
 	defer client.Close()
 
-	// Authenticate with TrueNAS middleware
-	if err := client.Authenticate(); err != nil {
-		log.Fatalf("Failed to authenticate with TrueNAS: %v", err)
-	}
-	log.Println("Successfully authenticated with TrueNAS middleware")
+	// Authenticate on tool calls so a temporary backend failure cannot kill
+	// the MCP transport. Client.Call retries authentication on the next call.
 
 	// Create task manager
 	taskConfig := tasks.PollerConfig{
