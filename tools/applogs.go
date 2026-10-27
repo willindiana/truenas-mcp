@@ -3,6 +3,8 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +61,7 @@ func resolveAppContainers(client *truenas.Client, appName string) ([]map[string]
 	}
 
 	if len(containers) > 0 {
+		sortContainers(containers)
 		return containers, nil
 	}
 
@@ -83,7 +86,22 @@ func resolveAppContainers(client *truenas.Client, appName string) ([]map[string]
 		containers = append(containers, entry)
 	}
 
+	sortContainers(containers)
 	return containers, nil
+}
+
+// sortContainers gives map-backed results a stable order.
+func sortContainers(containers []map[string]interface{}) {
+	sort.SliceStable(containers, func(i, j int) bool {
+		si, _ := containers[i]["service_name"].(string)
+		sj, _ := containers[j]["service_name"].(string)
+		if si != sj {
+			return si < sj
+		}
+		ii, _ := containers[i]["id"].(string)
+		ij, _ := containers[j]["id"].(string)
+		return ii < ij
+	})
 }
 
 // handleAppContainers lists the containers for an app so callers can pick one
@@ -136,11 +154,12 @@ func handleAppLogs(client *truenas.Client, args map[string]interface{}) (string,
 	}
 
 	tail := defaultLogTail
-	if t, ok := args["tail_lines"].(float64); ok && t > 0 {
+	if v, ok := args["tail_lines"]; ok {
+		t, ok := v.(float64)
+		if !ok || t != math.Trunc(t) || t < 1 || t > maxLogTail {
+			return "", fmt.Errorf("tail_lines must be an integer from 1 to %d", maxLogTail)
+		}
 		tail = int(t)
-	}
-	if tail > maxLogTail {
-		tail = maxLogTail
 	}
 
 	containerFilter, _ := args["container"].(string)
@@ -178,7 +197,7 @@ func handleAppLogs(client *truenas.Client, args map[string]interface{}) (string,
 			continue
 		}
 		if svc == "" {
-			svc = cid[:12]
+			svc = cid[:min(len(cid), 12)]
 		}
 
 		lines, err := collectContainerLogs(client, appName, cid, tail)
@@ -258,11 +277,8 @@ func collectContainerLogs(client *truenas.Client, appName, containerID string, t
 			}
 
 		case <-idle.C:
-			// No further output. If we have something, that is the whole tail.
-			if len(lines) > 0 {
-				return lines, nil
-			}
-			// Nothing yet: keep waiting until the hard deadline.
+			// No output during the first-event grace or after the last event.
+			return lines, nil
 
 		case <-deadline:
 			return lines, nil

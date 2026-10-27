@@ -2,11 +2,20 @@ package tools
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"math"
+	"runtime"
+	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/truenas/truenas-mcp/internal/mwtime"
+	"github.com/truenas/truenas-mcp/internal/safego"
 	"github.com/truenas/truenas-mcp/mcp"
 	"github.com/truenas/truenas-mcp/tasks"
 	"github.com/truenas/truenas-mcp/truenas"
@@ -16,6 +25,11 @@ type Registry struct {
 	client      *truenas.Client
 	taskManager *tasks.Manager
 	tools       map[string]Tool
+
+	// Safety policy, set by SetPolicy (tools/safety.go)
+	readOnly bool
+	allow    map[string]bool
+	deny     map[string]bool
 }
 
 type Tool struct {
@@ -30,6 +44,7 @@ func NewRegistry(client *truenas.Client, taskManager *tasks.Manager) *Registry {
 		tools:       make(map[string]Tool),
 	}
 	r.registerTools()
+	r.applySafety()
 	return r
 }
 
@@ -80,6 +95,14 @@ func (r *Registry) registerTools() {
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"train": map[string]interface{}{
+						"type":        "string",
+						"description": "Ignored. Accepted for compatibility only: the download always uses the system's configured update train",
+					},
+					"version": map[string]interface{}{
+						"type":        "string",
+						"description": "Ignored. Accepted for compatibility only: the download fetches whatever update the system's configured train offers",
+					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
 						"description": "Preview changes without executing (default: false)",
@@ -130,13 +153,25 @@ func (r *Registry) registerTools() {
 	r.tools["system_reboot"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "system_reboot",
-			Description: "Reboot the TrueNAS system. This will disconnect all active sessions and services. Use after applying system updates.",
+			Description: "Reboot the TrueNAS system. This will disconnect all active sessions and services. Use after applying system updates. Supports dry-run mode and an optional delay of up to 86400 seconds. A pending delayed reboot cannot be cancelled through this server.",
 			InputSchema: map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{},
+				"type": "object",
+				"properties": map[string]interface{}{
+					"delay": map[string]interface{}{
+						"type":        "integer",
+						"description": "Optional: seconds to wait before rebooting, 0-86400 (default: reboot immediately). Cannot be cancelled through this server once scheduled.",
+						"minimum":     0,
+						"maximum":     maxRebootDelay,
+					},
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Preview the reboot without executing (default: false)",
+						"default":     false,
+					},
+				},
 			},
 		},
-		Handler: handleSystemReboot,
+		Handler: handleSystemRebootWithDryRun,
 	}
 
 	// Boot environment management tools
@@ -402,89 +437,132 @@ func (r *Registry) registerTools() {
 	r.tools["refresh_directory_cache"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "refresh_directory_cache",
-			Description: "Refresh cached user and group data from the directory service. Use after making changes in Active Directory, LDAP, or IPA that need to be reflected immediately in TrueNAS.",
+			Description: "Refresh cached user and group data from the directory service. Use after making changes in Active Directory, LDAP, or IPA that need to be reflected immediately in TrueNAS. Supports dry-run mode.",
 			InputSchema: map[string]interface{}{
-				"type":       "object",
-				"properties": map[string]interface{}{},
+				"type": "object",
+				"properties": map[string]interface{}{
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Preview without refreshing (default: false)",
+						"default":     false,
+					},
+				},
 			},
 		},
-		Handler: handleRefreshDirectoryCache,
+		Handler: handleRefreshDirectoryCacheWithDryRun,
 	}
 
 	r.tools["configure_directory_service"] = Tool{
 		Definition: mcp.Tool{
 			Name: "configure_directory_service",
-			Description: `Configure and join a directory service (Active Directory, LDAP, or IPA). Setting enable=true joins the domain automatically.
+			Description: `Configure and join a directory service (Active Directory, LDAP, or IPA) with TrueNAS directoryservices.update (TrueNAS 25.10 or later). Setting enable=true joins the domain automatically the first time. The arguments are the fields of that API call. Omitted optional fields keep their current value.
 
-**Service Types:**
-- ACTIVEDIRECTORY: Microsoft Active Directory integration
-- LDAP: Generic LDAP server (OpenLDAP, etc.)
-- IPA: FreeIPA / Red Hat Identity Management
+**To enable or change a service, service_type, credential, configuration and enable are all required, and configuration must match service_type. The old flat arguments (type, server, bindname, netbiosname, ssl, domain, ...) no longer exist: put them in credential and configuration as below.**
 
-**Credential Types by Service:**
+**To disable the configured service, send only enable=false** (no service_type, credential or configuration): the settings are kept and domain authentication stops until it is enabled again. When service_type is sent with enable=false, a KERBEROS_USER credential is rejected for ACTIVEDIRECTORY and IPA (TrueNAS does not store it); use KERBEROS_PRINCIPAL.
 
-Active Directory:
-- KERBEROS_USER: {type: "KERBEROS_USER", username: "admin", password: "pass"}
-- KERBEROS_PRINCIPAL: {type: "KERBEROS_PRINCIPAL", principal: "host/truenas", keytab: "..."}
+**Credential (credential_type and its fields):**
 
-LDAP:
-- LDAP_PLAIN: {type: "LDAP_PLAIN", binddn: "cn=admin,dc=example,dc=com", bindpw: "pass"}
-- LDAP_ANONYMOUS: {type: "LDAP_ANONYMOUS"}
-- LDAP_MTLS: {type: "LDAP_MTLS", certificate_id: 123}
-- KERBEROS_USER or KERBEROS_PRINCIPAL (same as Active Directory)
+Active Directory and IPA (Kerberos only; the first join needs KERBEROS_USER with domain admin rights):
+- KERBEROS_USER: {credential_type: "KERBEROS_USER", username: "admin", password: "pass"}
+- KERBEROS_PRINCIPAL: {credential_type: "KERBEROS_PRINCIPAL", principal: "host/truenas@EXAMPLE.COM"} (the principal must already be in a keytab on TrueNAS)
 
-IPA:
-- KERBEROS_USER or KERBEROS_PRINCIPAL (same as Active Directory)
+LDAP (also accepts the Kerberos types above, which need kerberos_realm to be set):
+- LDAP_PLAIN: {credential_type: "LDAP_PLAIN", binddn: "cn=admin,dc=example,dc=com", bindpw: "pass"}
+- LDAP_ANONYMOUS: {credential_type: "LDAP_ANONYMOUS"}
+- LDAP_MTLS: {credential_type: "LDAP_MTLS", client_certificate: "name of a certificate on TrueNAS"}
 
-**Configuration Object (service-specific):**
-For Active Directory: {hostname: "truenas-nyc", domain: "corp.example.com", ...}
-For LDAP: {hostname: "ldap.example.com", port: 389, ...}
-For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
+**Configuration (fields per service_type; * = required):**
+- ACTIVEDIRECTORY: hostname*, domain*, site, computer_account_ou, use_default_domain, enable_trusted_domains, trusted_domains, idmap
+  e.g. {hostname: "truenas", domain: "corp.example.com"}
+- IPA: target_server*, hostname*, domain*, basedn*, smb_domain, validate_certificates
+  e.g. {target_server: "ipa.example.com", hostname: "truenas", domain: "example.com", basedn: "dc=example,dc=com"}
+- LDAP: server_urls* (ldap:// or ldaps:// URIs), basedn*, starttls, validate_certificates, schema (RFC2307 or RFC2307BIS), search_bases, attribute_maps, auxiliary_parameters
+  e.g. {server_urls: ["ldaps://ldap.example.com"], basedn: "dc=example,dc=com"}
+idmap, trusted_domains, smb_domain, search_bases and attribute_maps are passed to TrueNAS unchanged; see the TrueNAS API docs for directoryservices.update for their fields.
 
 **Security:**
 - Credentials are stored in TrueNAS configuration
 - Use Kerberos principals with keytabs instead of passwords for production
-- Dry-run shows credential requirements without exposing values
+- Dry-run shows the exact payload that would be sent with every secret value masked (password, bindpw, ldap_user_dn_password in idmap and trusted_domains, ...); credential_type and username stay visible
 
-**Returns:** task_id for tracking long-running domain join operation (2-10 minutes typical)`,
+**Returns:** task_id for tracking the long-running domain join job (2-10 minutes typical)`,
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"service_type": map[string]interface{}{
 						"type":        "string",
 						"enum":        []string{"ACTIVEDIRECTORY", "LDAP", "IPA"},
-						"description": "Directory service type",
+						"description": "Directory service type. Selects which configuration fields apply.",
 					},
 					"enable": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Enable service (true to join domain, false to disable)",
+						"description": "Enable the service (true joins the domain the first time; false disables it but keeps the settings)",
 					},
 					"credential": map[string]interface{}{
 						"type":        "object",
-						"description": "Credential object with 'type' field and credential-specific fields (see tool description)",
+						"description": "Credential used to bind to the directory service. credential_type selects the other fields: KERBEROS_USER (username, password), KERBEROS_PRINCIPAL (principal), LDAP_PLAIN (binddn, bindpw), LDAP_ANONYMOUS (none), LDAP_MTLS (client_certificate). LDAP_* types are only valid for service_type LDAP.",
+						"properties": map[string]interface{}{
+							"credential_type": map[string]interface{}{
+								"type": "string",
+								"enum": []string{"KERBEROS_USER", "KERBEROS_PRINCIPAL", "LDAP_PLAIN", "LDAP_ANONYMOUS", "LDAP_MTLS"},
+							},
+							"username":           map[string]interface{}{"type": "string", "description": "KERBEROS_USER: account used to obtain a Kerberos ticket"},
+							"password":           map[string]interface{}{"type": "string", "description": "KERBEROS_USER: password of that account"},
+							"principal":          map[string]interface{}{"type": "string", "description": "KERBEROS_PRINCIPAL: principal present in a keytab on TrueNAS"},
+							"binddn":             map[string]interface{}{"type": "string", "description": "LDAP_PLAIN: distinguished name to bind as"},
+							"bindpw":             map[string]interface{}{"type": "string", "description": "LDAP_PLAIN: password of the bind DN"},
+							"client_certificate": map[string]interface{}{"type": "string", "description": "LDAP_MTLS: name of the client certificate on TrueNAS"},
+						},
+						"required":             []string{"credential_type"},
+						"additionalProperties": false,
 					},
 					"configuration": map[string]interface{}{
 						"type":        "object",
-						"description": "Service-specific configuration (domain, hostname, etc.)",
+						"description": "service_type specific configuration; see the tool description for the fields of each service type and which are required",
+						"properties": map[string]interface{}{
+							"hostname":               map[string]interface{}{"type": "string", "description": "ACTIVEDIRECTORY, IPA: hostname TrueNAS registers in the domain (required)"},
+							"domain":                 map[string]interface{}{"type": "string", "description": "ACTIVEDIRECTORY, IPA: DNS domain name (required)"},
+							"target_server":          map[string]interface{}{"type": "string", "description": "IPA: name of the IPA server used when joining or leaving (required)"},
+							"basedn":                 map[string]interface{}{"type": "string", "description": "IPA, LDAP: base DN for LDAP operations (required)"},
+							"server_urls":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "LDAP: server URIs beginning with ldap:// or ldaps:// (required)"},
+							"site":                   map[string]interface{}{"type": "string", "description": "ACTIVEDIRECTORY: Active Directory site (detected automatically when omitted)"},
+							"computer_account_ou":    map[string]interface{}{"type": "string", "description": "ACTIVEDIRECTORY: OU in which the computer account is created on first join"},
+							"use_default_domain":     map[string]interface{}{"type": "boolean", "description": "ACTIVEDIRECTORY: drop the domain prefix from user and group names"},
+							"enable_trusted_domains": map[string]interface{}{"type": "boolean", "description": "ACTIVEDIRECTORY: support trusted domains (set trusted_domains too)"},
+							"trusted_domains":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}, "description": "ACTIVEDIRECTORY: idmap configuration for each trusted domain"},
+							"idmap":                  map[string]interface{}{"type": "object", "description": "ACTIVEDIRECTORY: idmap settings (builtin and idmap_domain), passed to TrueNAS unchanged"},
+							"smb_domain":             map[string]interface{}{"type": "object", "description": "IPA: SMB domain settings, passed to TrueNAS unchanged"},
+							"validate_certificates":  map[string]interface{}{"type": "boolean", "description": "IPA, LDAP: validate the directory server's certificates (TrueNAS default: true)"},
+							"starttls":               map[string]interface{}{"type": "boolean", "description": "LDAP: use StartTLS"},
+							"schema":                 map[string]interface{}{"type": "string", "enum": []string{"RFC2307", "RFC2307BIS"}, "description": "LDAP: attribute schema of the server"},
+							"search_bases":           map[string]interface{}{"type": "object", "description": "LDAP: base_user, base_group and base_netgroup search bases, passed to TrueNAS unchanged"},
+							"attribute_maps":         map[string]interface{}{"type": "object", "description": "LDAP: attribute mappings for non-standard servers, passed to TrueNAS unchanged"},
+							"auxiliary_parameters":   map[string]interface{}{"type": "string", "description": "LDAP: extra SSSD parameters (not validated by TrueNAS)"},
+						},
+						"additionalProperties": false,
 					},
 					"enable_account_cache": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Cache user/group lists (default: true)",
-						"default":     true,
+						"description": "Cache user and group lists (TrueNAS default: true; omit to keep the current value)",
 					},
 					"enable_dns_updates": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Auto DNS updates via nsupdate (default: true)",
-						"default":     true,
+						"description": "Automatic DNS updates via nsupdate (TrueNAS default: true; omit to keep the current value)",
 					},
 					"timeout": map[string]interface{}{
 						"type":        "integer",
-						"description": "DNS query and LDAP request timeout in seconds (5-60, default: 10)",
-						"default":     10,
+						"minimum":     5,
+						"maximum":     60,
+						"description": "DNS query and LDAP request timeout in seconds (5-60; TrueNAS default: 10)",
 					},
 					"kerberos_realm": map[string]interface{}{
 						"type":        "string",
-						"description": "Kerberos realm for authentication (optional)",
+						"description": "Kerberos realm used to authenticate to the directory service. Required for Kerberos credentials with service_type LDAP; detected automatically when first joining AD or IPA.",
+					},
+					"force": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Skip the check for an existing server registered with the same hostname in the domain. Can replace that server; do not use casually.",
 					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
@@ -492,7 +570,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"default":     false,
 					},
 				},
-				"required": []string{"service_type", "enable", "credential"},
+				"required": []string{"enable"},
 			},
 		},
 		Handler: r.handleConfigureDirectoryServiceWithDryRun,
@@ -501,27 +579,46 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["leave_directory_service"] = Tool{
 		Definition: mcp.Tool{
 			Name: "leave_directory_service",
-			Description: `Disconnect from directory service and leave the domain.
+			Description: `Leave the Active Directory or IPA domain TrueNAS has joined, with TrueNAS directoryservices.leave (TrueNAS 25.10 or later).
+
+TrueNAS removes its computer account from the domain using the credential you provide, then resets its local directory service configuration and disables the service. LDAP cannot be left; use configure_directory_service with enable=false to disable it.
+
+**credential is required:** a KERBEROS_USER credential, {credential_type: "KERBEROS_USER", username: "admin", password: "pass"}, for an account with the administrative privileges needed to remove the computer account. It is used for this operation only and is never shown: the password is masked in the dry run and in stored task data.
 
 **WARNING:** This is a destructive operation:
 - Removes TrueNAS from the domain
-- Deletes computer account (if possible)
 - Clears all cached user/group data
 - All domain user authentication will stop working
 - SMB/NFS shares configured with domain users will become inaccessible
 
 **Alternative:** Use configure_directory_service with enable=false for temporary disable without leaving the domain.
 
-**Returns:** task_id for tracking the leave operation (30 seconds to 5 minutes typical)`,
+**Returns:** task_id for tracking the leave job (30 seconds to 5 minutes typical)`,
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"credential": map[string]interface{}{
+						"type":        "object",
+						"description": "KERBEROS_USER credential used to remove the computer account from the domain",
+						"properties": map[string]interface{}{
+							"credential_type": map[string]interface{}{
+								"type":        "string",
+								"enum":        []string{"KERBEROS_USER"},
+								"description": "Must be KERBEROS_USER, the only credential type directoryservices.leave accepts",
+							},
+							"username": map[string]interface{}{"type": "string", "description": "Account used to obtain a Kerberos ticket; it must exist on the domain controller"},
+							"password": map[string]interface{}{"type": "string", "description": "Password of that account"},
+						},
+						"required":             []string{"credential_type", "username", "password"},
+						"additionalProperties": false,
+					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
 						"description": "Preview operation without executing (default: false, STRONGLY RECOMMENDED to use dry_run first)",
 						"default":     false,
 					},
 				},
+				"required": []string{"credential"},
 			},
 		},
 		Handler: r.handleLeaveDirectoryServiceWithDryRun,
@@ -575,7 +672,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["query_snapshots"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "query_snapshots",
-			Description: "Query ZFS snapshots with optional filtering and sorting. Returns simplified snapshot information with creation info, dataset, and holds status. Use 'limit' to control result size, 'order_by' to sort.",
+			Description: "Query ZFS snapshots with optional filtering and sorting. Returns simplified snapshot information with creation info, sizes and dataset. Holds are included only with 'include_holds' or 'holds_only' (they cost an extra lookup per snapshot). Use 'limit' to control result size, 'order_by' to sort.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -598,7 +695,11 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 					},
 					"holds_only": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Optional: Return only snapshots with holds that prevent deletion (default: false)",
+						"description": "Optional: Return only snapshots with holds that prevent deletion (default: false). Implies include_holds.",
+					},
+					"include_holds": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Optional: Include each snapshot's holds (default: false; one extra lookup per snapshot on the NAS)",
 					},
 				},
 			},
@@ -666,7 +767,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["create_dataset"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "create_dataset",
-			Description: "Create a ZFS dataset (filesystem or volume) for storage. This tool is reusable for SMB shares, NFS exports, iSCSI LUNs, and application storage. Supports encryption, compression, quotas, and advanced ZFS features.\n\n**WIZARD GUIDANCE FOR LLM:**\nWhen helping users create datasets, ask these questions in order:\n\n1. **Pool Selection**: Query available pools first, ask which pool to use\n2. **Dataset Name**: Suggest format 'pool/shares/name' or 'pool/apps/name'\n3. **Dataset Type**: FILESYSTEM (default, for files) or VOLUME (for block storage/VMs)\n4. **Share Type Optimization** (if for sharing):\n   - SMB: Windows/Mac file shares (recommend for SMB shares)\n   - NFS: Unix/Linux file shares\n   - MULTIPROTOCOL: Both SMB and NFS access\n   - APPS: Application storage\n   - GENERIC: General purpose (default)\n5. **Encryption** (recommend for sensitive data):\n   - Ask: \"Is this for sensitive data?\"\n   - If yes: Recommend generate_key=true for simplicity\n   - If user wants passphrase: min 8 characters\n   - Algorithm: AES-256-GCM recommended\n6. **Compression**: LZ4 (recommended, balanced), ZSTD (modern), GZIP (higher compression), OFF\n7. **Space Quota** (optional): Ask if they want to limit size\n8. **ACL Type** (for SMB): NFSV4 (recommended for SMB/Windows), POSIX (Unix)\n9. **Advanced** (usually skip unless user asks):\n   - Deduplication: Warn about RAM overhead, recommend OFF\n   - Checksum, snapdir, atime, readonly\n\n**IMPORTANT RECOMMENDATIONS:**\n- For SMB shares: share_type=SMB, acltype=NFSV4, compression=LZ4\n- For NFS exports: share_type=NFS, acltype=POSIX, compression=LZ4\n- For multi-protocol: share_type=MULTIPROTOCOL, acltype=NFSV4\n- For apps: share_type=APPS, compression=LZ4 or ZSTD\n- Always recommend compression=LZ4 unless user has specific needs\n- Warn: Deduplication uses ~5GB RAM per TB, not recommended for most users\n- Warn: Encryption cannot be removed later, only option is to copy data elsewhere\n\n**BEFORE EXECUTING:**\n1. Use dry_run=true to preview the configuration\n2. Display summary showing: name, type, optimization, compression, encryption, quota, mountpoint\n3. Get explicit user confirmation with \"Shall I proceed?\"\n4. Warn: This is a WRITE operation creating permanent storage\n5. If encryption enabled, remind user to back up the key after creation\n\n**DRY RUN:**\nSet dry_run=true to preview what will be created without executing. Show user the preview, then ask for confirmation to proceed.",
+			Description: "Create a ZFS dataset (filesystem or volume) for storage. This tool is reusable for SMB shares, NFS exports, iSCSI LUNs, and application storage. Supports native ZFS encryption (encryption=true with encryption_options), compression, quotas, and advanced ZFS features.\n\n**WIZARD GUIDANCE FOR LLM:**\nWhen helping users create datasets, ask these questions in order:\n\n1. **Pool Selection**: Query available pools first, ask which pool to use\n2. **Dataset Name**: Suggest format 'pool/shares/name' or 'pool/apps/name'\n3. **Dataset Type**: FILESYSTEM (default, for files) or VOLUME (for block storage/VMs)\n4. **Share Type Optimization** (if for sharing):\n   - SMB: Windows/Mac file shares (recommend for SMB shares)\n   - NFS: Unix/Linux file shares\n   - MULTIPROTOCOL: Both SMB and NFS access\n   - APPS: Application storage\n   - GENERIC: General purpose (default)\n5. **Encryption** (recommend for sensitive data):\n   - Ask: \"Is this for sensitive data?\"\n   - If yes: set encryption=true and encryption_options with exactly ONE method; ask which the user wants and do not default to one: generate_key=true, passphrase (8-512 bytes) or key (64 hex characters). encryption_options without encryption=true is rejected\n   - generate_key: TrueNAS stores the key in its key database and does not return it; this tool cannot export it, so tell the user to back it up in the TrueNAS web UI (Datasets > select the dataset > Encryption > Export Key) and keep a copy somewhere other than this system\n   - passphrase: TrueNAS does not store it; if it is lost the data is lost\n   - key: the user must keep it; this tool does not return or recover it\n   - Under a passphrase-encrypted parent, the new dataset must use a passphrase (TrueNAS refuses generate_key and key there)\n   - The algorithm is not configurable through this tool; new encrypted datasets use AES-256-GCM\n6. **Compression**: LZ4 (recommended, balanced), ZSTD (modern), GZIP (higher compression), OFF\n7. **Space Quota** (optional): Ask if they want to limit size\n8. **ACL Type** (for SMB): NFSV4 (recommended for SMB/Windows), POSIX (Unix)\n9. **Advanced** (usually skip unless user asks):\n   - Deduplication: Warn about RAM overhead, recommend OFF\n   - Checksum, snapdir, atime, readonly\n\n**IMPORTANT RECOMMENDATIONS:**\n- For SMB shares: share_type=SMB, acltype=NFSV4, compression=LZ4\n- For NFS exports: share_type=NFS, acltype=POSIX, compression=LZ4\n- For multi-protocol: share_type=MULTIPROTOCOL, acltype=NFSV4\n- For apps: share_type=APPS, compression=LZ4 or ZSTD\n- Always recommend compression=LZ4 unless user has specific needs\n- Warn: Deduplication uses ~5GB RAM per TB, not recommended for most users\n- Warn: Encryption cannot be removed later, only option is to copy data elsewhere\n\n**BEFORE EXECUTING:**\n1. Use dry_run=true to preview the configuration\n2. Display summary showing: name, type, optimization, compression, encryption, quota, mountpoint\n3. Get explicit user confirmation with \"Shall I proceed?\"\n4. Warn: This is a WRITE operation creating permanent storage\n5. If encryption enabled, remind the user of the key-backup note for the chosen method after creation\n\n**DRY RUN:**\nSet dry_run=true to preview what will be created without executing. Show user the preview, then ask for confirmation to proceed.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -699,22 +800,29 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"description": "NFSV4 (recommended for SMB/Windows ACLs) or POSIX (Unix permissions)",
 						"enum":        []string{"NFSV4", "POSIX", "INHERIT"},
 					},
+					"encryption": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Create the dataset as a new ZFS encryption root (cannot be removed later). Requires encryption_options. inherit_encryption is sent as false automatically; passing inherit_encryption=true with this is rejected",
+					},
 					"encryption_options": map[string]interface{}{
 						"type":        "object",
-						"description": "Encryption configuration (cannot be removed later)",
+						"description": "Key material for a new encrypted dataset; only valid together with encryption=true. Provide exactly one of generate_key=true, passphrase or key. The passphrase and key are secrets and are masked in dry-run output",
 						"properties": map[string]interface{}{
 							"generate_key": map[string]interface{}{
 								"type":        "boolean",
-								"description": "Auto-generate encryption key (recommended for simplicity)",
+								"description": "Let TrueNAS generate the key and store it in its key database; it is not returned. This tool cannot export it: back it up in the TrueNAS web UI (Datasets > select the dataset > Encryption > Export Key) and keep a copy elsewhere. Refused under a passphrase-encrypted parent",
 							},
 							"passphrase": map[string]interface{}{
 								"type":        "string",
-								"description": "User passphrase (min 8 chars) - alternative to generate_key",
+								"description": "Passphrase of 8 to 512 bytes. It is not stored by TrueNAS: if it is lost the data is lost",
 							},
-							"algorithm": map[string]interface{}{
+							"key": map[string]interface{}{
 								"type":        "string",
-								"description": "Encryption algorithm (default: AES-256-GCM recommended)",
-								"enum":        []string{"AES-128-CCM", "AES-192-CCM", "AES-256-CCM", "AES-128-GCM", "AES-192-GCM", "AES-256-GCM"},
+								"description": "Raw encryption key as exactly 64 hexadecimal characters. You must keep a copy; this tool never returns it. Refused under a passphrase-encrypted parent",
+							},
+							"pbkdf2iters": map[string]interface{}{
+								"type":        "integer",
+								"description": "PBKDF2 iterations for a passphrase (optional; only with passphrase; minimum 100000, TrueNAS 27.0 requires at least 1300000). Omit to use the TrueNAS default",
 							},
 						},
 					},
@@ -754,6 +862,33 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"type":        "string",
 						"description": "File access time tracking: ON or OFF (OFF improves performance)",
 						"enum":        []string{"ON", "OFF", "INHERIT"},
+					},
+					"volblocksize": map[string]interface{}{
+						"type":        "string",
+						"description": "VOLUME type only (rejected for FILESYSTEM): volume block size. Defaults to 16K, or 128K on a dRAID pool",
+						"enum":        []string{"512", "512B", "1K", "2K", "4K", "8K", "16K", "32K", "64K", "128K"},
+					},
+					"inherit_encryption": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Optional. Whether the dataset inherits the parent's encryption settings (TrueNAS default: true). false asks for an unencrypted dataset, which TrueNAS rejects under an encrypted parent. To create a new encrypted dataset use encryption=true with encryption_options instead (inherit_encryption is then sent as false automatically); inherit_encryption=true together with encryption=true is rejected",
+					},
+					"user_properties": map[string]interface{}{
+						"type":        "array",
+						"description": "Optional ZFS user properties to set on the dataset, each an object with a 'key' containing a colon in namespace:property form (e.g. 'org:note') and a string 'value'. Property names should use only lowercase letters, digits and ': . _ -' (newer TrueNAS versions reject anything else) and must not repeat within the list. Do not set properties TrueNAS manages itself (org.freenas:description, org.freenas:quota_warning, org.freenas:quota_critical, org.freenas:refquota_warning, org.freenas:refquota_critical, org.truenas:managedby); use the dedicated fields (comments, quota_warning, ...) instead",
+						"items": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"key": map[string]interface{}{
+									"type":        "string",
+									"description": "User property name in namespace:property form; must contain a colon, e.g. 'org:note'",
+								},
+								"value": map[string]interface{}{
+									"type":        "string",
+									"description": "User property value",
+								},
+							},
+							"required": []string{"key", "value"},
+						},
 					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
@@ -973,11 +1108,16 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"type":        "string",
 						"description": "UUID of the alert to dismiss",
 					},
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Preview without changing the alert (default: false)",
+						"default":     false,
+					},
 				},
 				"required": []string{"uuid"},
 			},
 		},
-		Handler: handleDismissAlert,
+		Handler: handleDismissAlertWithDryRun,
 	}
 
 	// Restore alert
@@ -992,11 +1132,16 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"type":        "string",
 						"description": "UUID of the alert to restore",
 					},
+					"dry_run": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Preview without changing the alert (default: false)",
+						"default":     false,
+					},
 				},
 				"required": []string{"uuid"},
 			},
 		},
-		Handler: handleRestoreAlert,
+		Handler: handleRestoreAlertWithDryRun,
 	}
 
 	// System reporting metrics
@@ -1085,7 +1230,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["get_arc_metrics"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "get_arc_metrics",
-			Description: "Get ZFS ARC (Adaptive Replacement Cache) performance metrics including cache size, demand hit/miss rates, and L2ARC statistics.",
+			Description: "Get ZFS ARC (Adaptive Replacement Cache) reporting metrics such as ARC size. Which ARC graphs exist depends on the TrueNAS version; the supported set is discovered from the server.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -1093,19 +1238,8 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"type": "array",
 						"items": map[string]interface{}{
 							"type": "string",
-							"enum": []string{
-								"arcfreememory", "arcavailablememory", "arcsize",
-								"demandaccessespersecond", "demanddataaccessespersecond", "demandmetadataaccessespersecond",
-								"demanddatahitspersecond", "demanddataiohitspersecond", "demanddatamissespersecond",
-								"demanddatahitpercentage", "demanddataiohitpercentage", "demanddatamisspercentage",
-								"demandmetadatahitspersecond", "demandmetadataiohitspersecond", "demandmetadatamissespersecond",
-								"demandmetadatahitpercentage", "demandmetadataiohitpercentage", "demandmetadatamisspercentage",
-								"l2archhitspersecond", "l2arcmissespersecond", "totall2arcaccessespersecond",
-								"l2architpercentage", "l2arcmisspercentage",
-								"l2arcbytesreadpersecond", "l2arcbyteswrittenpersecond",
-							},
 						},
-						"description": "ARC metrics to retrieve (default: arcfreememory, arcavailablememory, arcsize)",
+						"description": "ARC graphs to retrieve, e.g. 'arcsize'. Other ARC graphs are accepted when the server supports them. Default: every ARC graph the server supports.",
 					},
 					"unit": map[string]interface{}{
 						"type":    "string",
@@ -1152,7 +1286,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["query_apps"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "query_apps",
-			Description: "Query installed applications with their status, versions, and available updates",
+			Description: "Query installed applications with their status, versions, and available updates. upgrade_available tells whether an upgrade exists; latest_version is the newest catalog version (always set, in catalog form, not comparable to human_version)",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -1210,6 +1344,8 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 						"type":        "integer",
 						"description": "Number of log lines to return per container (default 200, max 5000)",
 						"default":     defaultLogTail,
+						"minimum":     1,
+						"maximum":     maxLogTail,
 					},
 				},
 				"required": []string{"app_name"},
@@ -1222,7 +1358,7 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 	r.tools["upgrade_app"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "upgrade_app",
-			Description: "Upgrade an application to a newer version. Supports dry-run mode to preview changes. Returns a task ID for tracking progress. This is a write operation that modifies the system.",
+			Description: "Upgrade an application to a newer version. Supports dry-run mode to preview changes. Returns a task ID for tracking progress; the task completes only once the app is observed RUNNING after the upgrade job finishes (otherwise it fails with the app's state; if the app was merely still starting when health_timeout_seconds ran out, the message says the upgrade itself succeeded and the wait can be raised). TrueNAS always stops the app during the upgrade and snapshots its ix-volumes dataset for rollback. This is a write operation that modifies the system.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -1237,8 +1373,15 @@ For IPA: {hostname: "ipa.example.com", domain: "example.com", ...}
 					},
 					"snapshot_hostpaths": map[string]interface{}{
 						"type":        "boolean",
-						"description": "Create snapshots of host volumes before upgrade (default: true for safety)",
+						"description": "Also request snapshots of the app's host paths before the upgrade (default: true for safety). This only affects host paths: TrueNAS always stops the app and snapshots its ix-volumes dataset regardless. It is a request, not a confirmation: only host paths that are ZFS datasets are snapshotted and the upgrade job does not report which snapshots it took.",
 						"default":     true,
+					},
+					"health_timeout_seconds": map[string]interface{}{
+						"type":        "integer",
+						"description": "After the upgrade job finishes, how long to wait for the app to report RUNNING before the task fails (default: 60; 0 checks once without waiting). Must be an integer from 0 to 600, anything else is rejected. Raise it for slow-starting apps: running out of time while the app is still starting fails the task but does not mean the upgrade failed.",
+						"default":     defaultUpgradeHealthTimeoutSeconds,
+						"minimum":     0,
+						"maximum":     maxUpgradeHealthTimeoutSeconds,
 					},
 					"dry_run": map[string]interface{}{
 						"type":        "boolean",
@@ -1707,7 +1850,7 @@ Returns task_id for tracking progress with tasks_get.
 	r.tools["query_jobs"] = Tool{
 		Definition: mcp.Tool{
 			Name:        "query_jobs",
-			Description: "Query system jobs (running, pending, or completed tasks like replication, snapshots, scrubs, etc.)",
+			Description: "Query system jobs (running, pending, or completed tasks like replication, snapshots, scrubs, etc.), most recent first. Reports has_more and total when the list was cut by limit; long results and error text are truncated with a flag.",
 			InputSchema: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -1719,8 +1862,10 @@ Returns task_id for tracking progress with tasks_get.
 					},
 					"limit": map[string]interface{}{
 						"type":        "integer",
-						"description": "Maximum number of jobs to return (default: 50)",
+						"description": "Maximum number of jobs to return (default: 50). The response has has_more (and total, the number of jobs matching the state filter) when more exist than were returned. Each job entry is at most 4 KiB. Values above 9999 are capped at 9999.",
 						"default":     50,
+						"minimum":     1,
+						"maximum":     maxQueryJobsLimit,
 					},
 				},
 			},
@@ -1739,7 +1884,7 @@ Returns task_id for tracking progress with tasks_get.
 					"time_range": map[string]interface{}{
 						"type":        "string",
 						"enum":        []string{"DAY", "WEEK", "MONTH", "YEAR"},
-						"description": "Historical time range for trend analysis (default: MONTH for ~90 days)",
+						"description": "Historical time range for trend analysis (default: MONTH, about 30 days; note the get_*_metrics tools default to HOUR). The range used is returned as time_range in each section",
 						"default":     "MONTH",
 					},
 					"metrics": map[string]interface{}{
@@ -1818,16 +1963,46 @@ Returns task_id for tracking progress with tasks_get.
 
 func (r *Registry) ListTools() []mcp.Tool {
 	tools := make([]mcp.Tool, 0, len(r.tools))
-	for _, tool := range r.tools {
-		tools = append(tools, tool.Definition)
+	for name, tool := range r.tools {
+		if r.checkPolicy(name) == nil {
+			tools = append(tools, tool.Definition)
+		}
 	}
+	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
 	return tools
 }
 
-func (r *Registry) CallTool(name string, args map[string]interface{}) (string, error) {
+func (r *Registry) CallTool(name string, args map[string]interface{}) (result string, err error) {
+	// A panicking handler must not take down the server. Log the details to
+	// stderr (the panic value only for runtime errors, which carry no
+	// argument values) and return a generic error to the client.
+	defer func() {
+		if p := recover(); p != nil {
+			detail := fmt.Sprintf("%T", p)
+			if re, ok := p.(runtime.Error); ok {
+				detail = re.Error()
+			}
+			log.Printf("tool %s panicked: %s\n%s", name, detail, debug.Stack())
+			result, err = "", fmt.Errorf("internal error in tool %s; the operation may not have completed, check the system state before retrying", name)
+		}
+	}()
+
 	tool, exists := r.tools[name]
 	if !exists {
 		return "", fmt.Errorf("unknown tool: %s", name)
+	}
+	// Enforce the policy here, not only in ListTools: clients may call tools
+	// they were never shown.
+	if err := r.checkPolicy(name); err != nil {
+		return "", err
+	}
+	// Reject arguments the schema does not declare before anything runs,
+	// including the dry-run preview of a destructive tool.
+	if err := validateArgs(name, tool, args); err != nil {
+		return "", withMigrationHint(name, args, err)
+	}
+	if safetyOf(name).Access == Destructive && requiresConfirmation(tool, args) {
+		return r.confirmationRequired(name, tool, args)
 	}
 
 	return tool.Handler(r.client, args)
@@ -1846,7 +2021,9 @@ func handleSystemInfo(client *truenas.Client, args map[string]interface{}) (stri
 		return "", fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	formatted, err := json.MarshalIndent(info, "", "  ")
+	// Datetimes (buildtime, boottime, datetime) arrive as {"$date": ms};
+	// report them as ISO-8601 UTC strings like the other tools.
+	formatted, err := json.MarshalIndent(readableDatesMap(info), "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -1907,7 +2084,7 @@ func handleSystemHealth(client *truenas.Client, args map[string]interface{}) (st
 	if err == nil {
 		var cpuData []map[string]interface{}
 		if err := json.Unmarshal(cpuResult, &cpuData); err == nil && len(cpuData) > 0 {
-			if dataPoints, err := extractDataPoints(cpuData[0]); err == nil {
+			if dataPoints := columnPoints(cpuData[0], legendColumn(cpuData[0], "cpu", 1), true); len(dataPoints) > 0 {
 				avgCPU := calculateAverage(dataPoints)
 				if avgCPU > 85 {
 					capacityWarnings = append(capacityWarnings,
@@ -1932,6 +2109,7 @@ func handleSystemHealth(client *truenas.Client, args map[string]interface{}) (st
 		}
 	}
 
+	arcFreshnessNote := ""
 	if totalMemory > 0 {
 		memResult, err := client.Call("reporting.get_data", []interface{}{
 			map[string]interface{}{
@@ -1942,16 +2120,28 @@ func handleSystemHealth(client *truenas.Client, args map[string]interface{}) (st
 		if err == nil {
 			var memData []map[string]interface{}
 			if err := json.Unmarshal(memResult, &memData); err == nil && len(memData) > 0 {
-				if dataPoints, err := extractDataPoints(memData[0]); err == nil {
-					// Convert to percentage
-					avgMemBytes := calculateAverage(dataPoints)
-					avgMemPct := (avgMemBytes / totalMemory) * 100
+				if mem, err := availableMemorySamples(memData[0]); err == nil {
+					dataPoints := mem.all
+					// The "memory" graph reports available bytes, not used.
+					// The ZFS ARC is reclaimable, so exclude it when known.
+					// Only the latest ARC size is known, so it is compared with
+					// the latest complete available sample, not the hourly average.
+					avgAvailable := calculateAverage(dataPoints)
+					label, suffix := "Memory utilization", " (may include ZFS ARC cache)"
+					if arcBytes, freshKnown, err := currentArcBytes(client, nasReferenceTime(memData[0])); err == nil {
+						avgAvailable = mem.latest + arcBytes
+						label, suffix = "Memory utilization excluding ZFS ARC", ""
+						if !freshKnown {
+							arcFreshnessNote = arcFreshnessUnknownNote
+						}
+					}
+					avgMemPct := memoryUsedPct(totalMemory, avgAvailable)
 					if avgMemPct > 85 {
 						capacityWarnings = append(capacityWarnings,
-							fmt.Sprintf("Memory utilization critical: %.1f%%", avgMemPct))
+							fmt.Sprintf("%s critical: %.1f%%%s", label, avgMemPct, suffix))
 					} else if avgMemPct > 70 {
 						capacityWarnings = append(capacityWarnings,
-							fmt.Sprintf("Memory utilization elevated: %.1f%%", avgMemPct))
+							fmt.Sprintf("%s elevated: %.1f%%%s", label, avgMemPct, suffix))
 					}
 				}
 			}
@@ -2009,17 +2199,47 @@ func handleSystemHealth(client *truenas.Client, args map[string]interface{}) (st
 		}
 	}
 
-	response := map[string]interface{}{
-		"alerts":            alerts,
-		"alert_count":       len(alerts),
-		"active_jobs":       activeTasks,
-		"job_count":         len(activeTasks),
-		"capacity_warnings": capacityWarnings,
-		"directory_service": directoryServiceStatus,
-		"health_check":      "OK",
+	// Dismissed alerts are acknowledged: count them separately, not as
+	// active.
+	activeAlerts, criticalAlerts, dismissedAlerts := 0, 0, 0
+	for _, alert := range alerts {
+		if dismissed, _ := alert["dismissed"].(bool); dismissed {
+			dismissedAlerts++
+			continue
+		}
+		activeAlerts++
+		switch level, _ := alert["level"].(string); strings.ToUpper(level) {
+		case "CRITICAL", "ALERT", "EMERGENCY":
+			criticalAlerts++
+		}
 	}
 
-	if len(alerts) > 0 {
+	// Only active alerts are listed; dismissed ones are only counted
+	// (list_alerts returns them).
+	activeAlertList := make([]map[string]interface{}, 0, activeAlerts)
+	for _, alert := range alerts {
+		if dismissed, _ := alert["dismissed"].(bool); !dismissed {
+			activeAlertList = append(activeAlertList, readableDatesMap(alert))
+		}
+	}
+
+	response := map[string]interface{}{
+		"alerts":                activeAlertList,
+		"alert_count":           activeAlerts,
+		"critical_alert_count":  criticalAlerts,
+		"dismissed_alert_count": dismissedAlerts,
+		"active_jobs":           activeTasks,
+		"job_count":             len(activeTasks),
+		"capacity_warnings":     capacityWarnings,
+		"directory_service":     directoryServiceStatus,
+		"health_check":          "OK",
+	}
+
+	if arcFreshnessNote != "" {
+		response["arc_freshness_note"] = arcFreshnessNote
+	}
+
+	if activeAlerts > 0 {
 		response["health_check"] = "ALERTS_PRESENT"
 	}
 
@@ -2338,8 +2558,18 @@ func handleQuerySnapshots(client *truenas.Client, args map[string]interface{}) (
 		filters = append(filters, []interface{}{"pool", "=", pool})
 	}
 
-	// Options parameter (required by API even if empty)
-	options := map[string]interface{}{}
+	// Request creation time and sizes explicitly: TrueNAS 27.0 only returns
+	// the properties named in extra.properties. Holds are only returned
+	// with extra.holds, which costs one extra ZFS lookup per snapshot, so
+	// they are requested only for holds_only or include_holds.
+	holdsOnly, _ := args["holds_only"].(bool)
+	includeHolds, _ := args["include_holds"].(bool)
+	wantHolds := holdsOnly || includeHolds
+	extra := map[string]interface{}{"properties": snapshotProperties}
+	if wantHolds {
+		extra["holds"] = true
+	}
+	options := map[string]interface{}{"extra": extra}
 
 	result, err := client.Call("pool.snapshot.query", filters, options)
 	if err != nil {
@@ -2359,7 +2589,7 @@ func handleQuerySnapshots(client *truenas.Client, args map[string]interface{}) (
 	}
 
 	// Filter by holds_only if requested
-	if holdsOnly, ok := args["holds_only"].(bool); ok && holdsOnly {
+	if holdsOnly {
 		filtered := make([]map[string]interface{}, 0)
 		for _, snap := range simplified {
 			if holdsCount, ok := snap["holds_count"].(int); ok && holdsCount > 0 {
@@ -2391,6 +2621,7 @@ func handleQuerySnapshots(client *truenas.Client, args map[string]interface{}) (
 		"snapshots":       simplified,
 		"snapshot_count":  len(simplified),
 		"total_snapshots": totalSnapshots,
+		"holds_included":  wantHolds,
 	}
 	if dataset, ok := args["dataset"].(string); ok && dataset != "" {
 		response["dataset_filter"] = dataset
@@ -2398,7 +2629,7 @@ func handleQuerySnapshots(client *truenas.Client, args map[string]interface{}) (
 	if pool, ok := args["pool"].(string); ok && pool != "" {
 		response["pool_filter"] = pool
 	}
-	if holdsOnly, ok := args["holds_only"].(bool); ok && holdsOnly {
+	if holdsOnly {
 		response["holds_filter"] = "only snapshots with holds"
 	}
 	if len(simplified) < totalSnapshots {
@@ -2421,10 +2652,26 @@ func simplifySnapshot(snap map[string]interface{}) map[string]interface{} {
 		"pool":          snap["pool"],
 	}
 
-	// Parse creation date from snapshot name if it matches pattern
-	if snapName, ok := snap["snapshot_name"].(string); ok {
+	// Creation time: the ZFS "creation" property when present, else a
+	// date parsed from the snapshot name.
+	props, _ := snap["properties"].(map[string]interface{})
+	if created, ts := snapshotCreated(props); ts > 0 {
+		summary["created"] = created
+		summary["created_timestamp"] = ts
+		summary["created_source"] = "zfs_property"
+	} else if snapName, ok := snap["snapshot_name"].(string); ok {
 		if parsedDate := parseSnapshotDate(snapName); parsedDate != "" {
 			summary["created_date"] = parsedDate
+			summary["created_source"] = "snapshot_name"
+		}
+	}
+
+	// Space: "used" is space unique to the snapshot, "referenced" the
+	// data it refers to.
+	for _, prop := range []string{"used", "referenced"} {
+		if n, ok := snapshotPropertyBytes(props, prop); ok {
+			summary[prop+"_bytes"] = n
+			summary[prop] = formatBytes(n)
 		}
 	}
 
@@ -2514,7 +2761,17 @@ func sortSnapshots(snapshots []map[string]interface{}, orderBy string) {
 			}
 			return false
 		case "created":
-			// Sort by parsed created_date descending, fallback to name
+			// Newest first: creation property timestamp, then the date
+			// parsed from the name, then the name. Snapshots with a
+			// timestamp sort before those without.
+			iTS, iTSOk := snapshots[i]["created_timestamp"].(int64)
+			jTS, jTSOk := snapshots[j]["created_timestamp"].(int64)
+			if iTSOk && jTSOk && iTS != jTS {
+				return iTS > jTS
+			}
+			if iTSOk != jTSOk {
+				return iTSOk
+			}
 			iCreated, iOk := snapshots[i]["created_date"].(string)
 			jCreated, jOk := snapshots[j]["created_date"].(string)
 			if iOk && jOk {
@@ -2651,24 +2908,36 @@ func simplifyVM(vm map[string]interface{}) map[string]interface{} {
 		summary["description"] = desc
 	}
 
-	// CPU configuration
-	if vcpus, ok := vm["vcpus"].(float64); ok {
-		summary["vcpus"] = int(vcpus)
+	// CPU topology: the API's "vcpus" is the number of sockets, "cores"
+	// is cores per socket and "threads" threads per core, so the guest
+	// sees vcpus*cores*threads virtual CPUs.
+	sockets, sOk := vm["vcpus"].(float64)
+	cores, cOk := vm["cores"].(float64)
+	threads, tOk := vm["threads"].(float64)
+	if sOk {
+		summary["sockets"] = int(sockets)
 	}
-	if cores, ok := vm["cores"].(float64); ok {
-		summary["cores"] = int(cores)
+	if cOk {
+		summary["cores_per_socket"] = int(cores)
 	}
-	if threads, ok := vm["threads"].(float64); ok {
-		summary["threads"] = int(threads)
+	if tOk {
+		summary["threads_per_core"] = int(threads)
+	}
+	if sOk || cOk || tOk {
+		// Each value defaults to 1 in the VM schema.
+		summary["total_vcpus"] = atLeastOne(sockets) * atLeastOne(cores) * atLeastOne(threads)
 	}
 	if cpuMode, ok := vm["cpu_mode"].(string); ok {
 		summary["cpu_mode"] = cpuMode
 	}
 
-	// Memory (convert to GB for readability)
+	// Memory: the API value is in MiB.
 	if memory, ok := vm["memory"].(float64); ok {
-		summary["memory_mb"] = int(memory)
-		summary["memory_gb"] = fmt.Sprintf("%.1f GB", memory/1024.0)
+		summary["memory_mib"] = int(memory)
+		summary["memory_gib"] = formatGiB(memory)
+	}
+	if minMemory, ok := vm["min_memory"].(float64); ok && minMemory > 0 {
+		summary["min_memory_mib"] = int(minMemory)
 	}
 
 	// Boot configuration
@@ -2799,8 +3068,8 @@ func sortVMs(vms []map[string]interface{}, orderBy string) {
 			return false
 		case "memory":
 			// Sort by memory descending (largest first)
-			iMem, iOk := vms[i]["memory_mb"].(int)
-			jMem, jOk := vms[j]["memory_mb"].(int)
+			iMem, iOk := vms[i]["memory_mib"].(int)
+			jMem, jOk := vms[j]["memory_mib"].(int)
 			if iOk && jOk {
 				return iMem > jMem
 			}
@@ -2858,6 +3127,9 @@ func handleListAlerts(client *truenas.Client, args map[string]interface{}) (stri
 			}
 		}
 		alerts = filtered
+	}
+	for i, alert := range alerts {
+		alerts[i] = readableDatesMap(alert)
 	}
 
 	formatted, err := json.MarshalIndent(alerts, "", "  ")
@@ -2951,35 +3223,9 @@ func handleGetSystemMetrics(client *truenas.Client, args map[string]interface{})
 			continue
 		}
 
-		// Keep aggregations and metadata, but sample data points to reduce size
 		summary := make(map[string]interface{})
 		if len(fullData) > 0 {
-			for key, value := range fullData[0] {
-				if key == "data" {
-					// Include sample of data points: first 10 and last 10
-					if dataArray, ok := value.([]interface{}); ok {
-						summary["data_points_total"] = len(dataArray)
-						sample := make([]interface{}, 0)
-
-						// First 10 points
-						for i := 0; i < 10 && i < len(dataArray); i++ {
-							sample = append(sample, dataArray[i])
-						}
-
-						// Last 10 points (if we have more than 20 total)
-						if len(dataArray) > 20 {
-							for i := len(dataArray) - 10; i < len(dataArray); i++ {
-								sample = append(sample, dataArray[i])
-							}
-						}
-
-						summary["data_sample"] = sample
-					}
-				} else {
-					// Keep all other fields: aggregations, start, end, legend, name, identifier
-					summary[key] = value
-				}
-			}
+			summary = summarizeSystemGraph(fullData[0], apiGraph)
 		}
 		response[graph] = summary
 	}
@@ -3079,6 +3325,8 @@ func handleGetNetworkMetrics(client *truenas.Client, args map[string]interface{}
 					summary[key] = value
 				}
 			}
+			// Units of every series in "data" and "aggregations".
+			summary["unit"] = reportingUnits["interface"]
 			summaries = append(summaries, summary)
 		}
 
@@ -3123,9 +3371,13 @@ func handleGetDiskMetrics(client *truenas.Client, args map[string]interface{}) (
 
 	// Find the requested graph type and extract identifiers
 	var diskIdentifiers []string
+	graphUnit := reportingUnits[graphType]
 	for _, graph := range graphs {
 		graphName, nameOk := graph["name"].(string)
 		if nameOk && graphName == graphType {
+			if label, ok := graph["vertical_label"].(string); ok && label != "" {
+				graphUnit = label
+			}
 			// Get the identifiers array
 			if identifiersRaw, ok := graph["identifiers"]; ok && identifiersRaw != nil {
 				if identifiersArray, ok := identifiersRaw.([]interface{}); ok {
@@ -3210,6 +3462,10 @@ func handleGetDiskMetrics(client *truenas.Client, args map[string]interface{}) (
 					summary[key] = value
 				}
 			}
+			// Units of every series in "data" and "aggregations".
+			if graphUnit != "" {
+				summary["unit"] = graphUnit
+			}
 			summaries = append(summaries, summary)
 		}
 
@@ -3228,24 +3484,246 @@ func handleGetDiskMetrics(client *truenas.Client, args map[string]interface{}) (
 	return string(formatted), nil
 }
 
+// fallbackArcGraphs is used when the server's supported graphs cannot be
+// discovered. 'arcsize' is accepted by reporting.get_data on 25.04 through
+// 27.0; other ARC graphs vary between releases.
+var fallbackArcGraphs = []string{"arcsize"}
+
+// arcGraphCache holds a successful ARC graph discovery per client, tagged
+// with the session generation it was made on so a reconnect or new login
+// discovers again (the server may have been upgraded meanwhile).
+var arcGraphCache sync.Map // *truenas.Client -> arcGraphEntry
+
+type arcGraphEntry struct {
+	gen    uint64
+	graphs []string
+}
+
+// discoveryTimeout bounds each discovery call; both run concurrently, so
+// discovery adds at most this much to the first get_arc_metrics call.
+var discoveryTimeout = 10 * time.Second
+
+// supportedArcGraphs returns the ARC graphs (names starting with "arc")
+// that reporting.get_data accepts on this server. reporting.graphs lists
+// the graph plugins the server has, but on 27.0 it lists plugins that
+// reporting.get_data's schema rejects, so the accepted names from
+// core.get_methods are intersected with it. Only a complete discovery is
+// cached (per session); a failed or partial one is retried next call.
+func supportedArcGraphs(client *truenas.Client) []string {
+	gen, err := client.SessionGeneration()
+	if err != nil {
+		return fallbackArcGraphs
+	}
+	if cached, ok := arcGraphCache.Load(client); ok {
+		if e := cached.(arcGraphEntry); e.gen == gen {
+			return e.graphs
+		}
+	}
+	graphs, complete := discoverArcGraphs(client)
+	if complete {
+		arcGraphCache.Store(client, arcGraphEntry{gen: gen, graphs: graphs})
+	}
+	return graphs
+}
+
+// recoverDiscovery is deferred by the ARC graph discovery goroutines.
+func recoverDiscovery(source string) {
+	if r := recover(); r != nil {
+		log.Printf("ARC graph discovery (%s) panicked: %s\n%s", source, safego.Describe(r), debug.Stack())
+	}
+}
+
+// discoverArcGraphs returns the supported ARC graphs and whether discovery
+// was complete (both sources answered and at least one ARC graph matched).
+func discoverArcGraphs(client *truenas.Client) ([]string, bool) {
+	var accepted, offered []string
+	var wg sync.WaitGroup
+	wg.Add(2)
+	// CallTool's recover does not cover these goroutines. A panic in either
+	// is logged and leaves that source unanswered (nil), like an API error.
+	go func() {
+		defer wg.Done()
+		defer recoverDiscovery("get_data schema")
+		accepted = getDataAcceptedGraphs(client)
+	}()
+	go func() {
+		defer wg.Done()
+		defer recoverDiscovery("reporting.graphs")
+		offered = reportingGraphNames(client)
+	}()
+	wg.Wait()
+
+	var names []string
+	switch {
+	case accepted != nil && offered != nil:
+		for _, n := range offered {
+			if slices.Contains(accepted, n) {
+				names = append(names, n)
+			}
+		}
+	case accepted != nil:
+		// The schema alone is authoritative for what get_data accepts.
+		names = accepted
+	}
+	// reporting.graphs alone is not used: on 27.0 it lists ARC graphs that
+	// reporting.get_data rejects.
+	arc := make([]string, 0, len(names))
+	for _, n := range names {
+		if strings.HasPrefix(n, "arc") && !slices.Contains(arc, n) {
+			arc = append(arc, n)
+		}
+	}
+	if len(arc) == 0 {
+		return fallbackArcGraphs, false
+	}
+	sort.Strings(arc)
+	return arc, accepted != nil && offered != nil
+}
+
+// reportingGraphNames returns the names from reporting.graphs, or nil.
+func reportingGraphNames(client *truenas.Client) []string {
+	result, err := client.CallWithTimeout(discoveryTimeout, "reporting.graphs")
+	if err != nil {
+		return nil
+	}
+	var items []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(result, &items); err != nil || len(items) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Name != "" {
+			names = append(names, it.Name)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// getDataAcceptedGraphs returns the graph names allowed by the
+// reporting.get_data argument schema (graphs[].name enum) as published by
+// core.get_methods, or nil if unavailable.
+func getDataAcceptedGraphs(client *truenas.Client) []string {
+	result, err := client.CallWithTimeout(discoveryTimeout, "core.get_methods", "reporting")
+	if err != nil {
+		return nil
+	}
+	var methods map[string]struct {
+		Accepts json.RawMessage `json:"accepts"`
+	}
+	if err := json.Unmarshal(result, &methods); err != nil {
+		return nil
+	}
+	method, ok := methods["reporting.get_data"]
+	if !ok {
+		return nil
+	}
+	var accepts []interface{}
+	if err := json.Unmarshal(method.Accepts, &accepts); err != nil || len(accepts) == 0 {
+		return nil
+	}
+	// accepts is one JSON schema per argument; the first is graphs, an
+	// array of {name, identifier}. Read accepts[0].items.properties.name
+	// and only walk the schema if that path is absent.
+	if graphs, ok := accepts[0].(map[string]interface{}); ok {
+		if items, ok := graphs["items"].(map[string]interface{}); ok {
+			if out := nameEnum(items); out != nil {
+				return out
+			}
+		}
+	}
+	return findNameEnum(accepts[0])
+}
+
+// nameEnum returns schema.properties.name.enum as strings, or nil.
+func nameEnum(schema map[string]interface{}) []string {
+	props, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	name, ok := props["name"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	enum, ok := name["enum"].([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(enum))
+	for _, e := range enum {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// findNameEnum walks a JSON schema for the first properties.name.enum list.
+func findNameEnum(node interface{}) []string {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		if out := nameEnum(v); out != nil {
+			return out
+		}
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if out := findNameEnum(v[k]); out != nil {
+				return out
+			}
+		}
+	case []interface{}:
+		for _, e := range v {
+			if out := findNameEnum(e); out != nil {
+				return out
+			}
+		}
+	}
+	return nil
+}
+
+// conciseError returns the first line of err's message, dropping the
+// request context and middleware traceback the client appends after it.
+func conciseError(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, "\n"); i >= 0 {
+		msg = msg[:i]
+	}
+	return strings.TrimSpace(msg)
+}
+
 func handleGetArcMetrics(client *truenas.Client, args map[string]interface{}) (string, error) {
 	unit := "HOUR"
 	if u, ok := args["unit"].(string); ok && u != "" {
 		unit = u
 	}
 
-	// Default graphs if not specified
-	graphs := []string{"arcfreememory", "arcavailablememory", "arcsize"}
+	// Default to every ARC graph the server supports.
+	supported := supportedArcGraphs(client)
+	graphs := supported
 	if g, ok := args["graphs"].([]interface{}); ok && len(g) > 0 {
-		graphs = make([]string, len(g))
-		for i, v := range g {
-			if s, ok := v.(string); ok {
-				graphs[i] = s
+		graphs = make([]string, 0, len(g))
+		for _, v := range g {
+			s, _ := v.(string)
+			if !slices.Contains(supported, s) {
+				return "", fmt.Errorf("unknown or unsupported ARC graph %q; supported graphs on this server: %s", s, strings.Join(supported, ", "))
 			}
+			graphs = append(graphs, s)
 		}
 	}
 
 	response := make(map[string]interface{})
+	failures := make(map[string]string)
 
 	for _, graph := range graphs {
 		result, err := client.Call("reporting.get_data", []interface{}{
@@ -3255,42 +3733,58 @@ func handleGetArcMetrics(client *truenas.Client, args map[string]interface{}) (s
 			},
 		}, map[string]interface{}{"unit": unit})
 		if err != nil {
-			response[graph] = map[string]string{"error": err.Error()}
+			failures[graph] = conciseError(err)
 			continue
 		}
 
 		var fullData []map[string]interface{}
 		if err := json.Unmarshal(result, &fullData); err != nil {
-			response[graph] = map[string]string{"error": fmt.Sprintf("parse error: %v", err)}
+			failures[graph] = fmt.Sprintf("unexpected response: %v", err)
+			continue
+		}
+		if len(fullData) == 0 {
+			failures[graph] = "no data returned"
 			continue
 		}
 
 		summary := make(map[string]interface{})
-		if len(fullData) > 0 {
-			for key, value := range fullData[0] {
-				if key == "data" {
-					if dataArray, ok := value.([]interface{}); ok {
-						summary["data_points_total"] = len(dataArray)
-						sample := make([]interface{}, 0)
+		for key, value := range fullData[0] {
+			if key == "data" {
+				if dataArray, ok := value.([]interface{}); ok {
+					summary["data_points_total"] = len(dataArray)
+					sample := make([]interface{}, 0)
 
-						for i := 0; i < 10 && i < len(dataArray); i++ {
+					for i := 0; i < 10 && i < len(dataArray); i++ {
+						sample = append(sample, dataArray[i])
+					}
+
+					if len(dataArray) > 20 {
+						for i := len(dataArray) - 10; i < len(dataArray); i++ {
 							sample = append(sample, dataArray[i])
 						}
-
-						if len(dataArray) > 20 {
-							for i := len(dataArray) - 10; i < len(dataArray); i++ {
-								sample = append(sample, dataArray[i])
-							}
-						}
-
-						summary["data_sample"] = sample
 					}
-				} else {
-					summary[key] = value
+
+					summary["data_sample"] = sample
 				}
+			} else {
+				summary[key] = value
 			}
 		}
 		response[graph] = summary
+	}
+
+	// Every requested graph failed: report a real tool error.
+	if len(response) == 0 && len(failures) > 0 {
+		parts := make([]string, 0, len(graphs))
+		for _, graph := range graphs {
+			if msg, ok := failures[graph]; ok {
+				parts = append(parts, graph+": "+msg)
+			}
+		}
+		return "", fmt.Errorf("failed to get ARC metrics: %s", strings.Join(parts, "; "))
+	}
+	if len(failures) > 0 {
+		response["errors"] = failures
 	}
 
 	formatted, err := json.MarshalIndent(response, "", "  ")
@@ -3505,13 +3999,16 @@ func handleQueryApps(client *truenas.Client, args map[string]interface{}) (strin
 			"id":                app["id"],
 			"state":             app["state"],
 			"version":           app["human_version"],
+			"human_version":     app["human_version"],
 			"upgrade_available": app["upgrade_available"],
 		}
 
-		// Include update info if available
-		if upgradeAvail, ok := app["upgrade_available"].(bool); ok && upgradeAvail {
-			summary["latest_version"] = app["latest_app_version"]
-		}
+		// latest_version is the newest catalog version of the app. app.query
+		// always sets it, also when it equals the installed one, and in the
+		// catalog form (e.g. "1.2.0"), not the human_version form
+		// ("<app>_<chart>"), so the two cannot be compared directly.
+		// upgrade_available is what tells whether an upgrade exists.
+		summary["latest_version"] = app["latest_version"]
 
 		// Include portals (web URLs) if available
 		if portals, ok := app["portals"].([]interface{}); ok && len(portals) > 0 {
@@ -3556,6 +4053,10 @@ func (r *Registry) handleUpgradeApp(client *truenas.Client, args map[string]inte
 	if !ok || appName == "" {
 		return "", fmt.Errorf("app_name is required")
 	}
+	healthTimeout, err := upgradeHealthTimeout(args)
+	if err != nil {
+		return "", err
+	}
 
 	version := "latest"
 	if v, ok := args["version"].(string); ok && v != "" {
@@ -3580,6 +4081,7 @@ func (r *Registry) handleUpgradeApp(client *truenas.Client, args map[string]inte
 	if err := json.Unmarshal(summaryResult, &summary); err != nil {
 		return "", fmt.Errorf("failed to parse upgrade summary: %w", err)
 	}
+	summary = normalizeUpgradeSummary(summary)
 
 	// Perform the upgrade - this returns a job ID since it's a long-running operation
 	upgradeOptions := map[string]interface{}{
@@ -3607,26 +4109,33 @@ func (r *Registry) handleUpgradeApp(client *truenas.Client, args map[string]inte
 		jobID = jobIDArray[0]
 	}
 
-	// Create task to track upgrade progress
+	// Create task to track upgrade progress. The task only completes once the
+	// app is seen RUNNING after the job finishes.
 	task, err := r.taskManager.CreateJobTask(
 		"upgrade_app",
 		args,
 		jobID,
 		1*time.Hour, // 1 hour TTL
+		tasks.WithAppHealthCheck(appName, healthTimeout),
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to create task: %w", err)
 	}
 
 	response := map[string]interface{}{
-		"app_name":         appName,
-		"upgrade_summary":  summary,
-		"task_id":          task.TaskID,
-		"task_status":      task.Status,
-		"poll_interval":    task.PollInterval,
-		"job_id":           jobID,
-		"snapshot_created": snapshotHostpaths,
-		"message":          fmt.Sprintf("Upgrade started. Track progress with tasks_get using task_id: %s", task.TaskID),
+		"app_name":        appName,
+		"upgrade_summary": summary,
+		"task_id":         task.TaskID,
+		"task_status":     task.Status,
+		"poll_interval":   task.PollInterval,
+		"job_id":          jobID,
+		// What was asked for, not what happened: the upgrade job does not
+		// report which snapshots, if any, it took.
+		"snapshot_requested": snapshotHostpaths,
+		"snapshot_note":      snapshotNote(snapshotHostpaths),
+		"message": fmt.Sprintf("Upgrade started. Track progress with tasks_get using task_id: %s. "+
+			"The task completes only after the app is RUNNING (waits up to %ds after the job finishes).",
+			task.TaskID, int(healthTimeout/time.Second)),
 	}
 
 	formatted, err := json.MarshalIndent(response, "", "  ")
@@ -3649,6 +4158,11 @@ func (u *upgradeAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string
 	appName, ok := args["app_name"].(string)
 	if !ok || appName == "" {
 		return nil, fmt.Errorf("app_name is required")
+	}
+
+	healthTimeout, err := upgradeHealthTimeout(args)
+	if err != nil {
+		return nil, err
 	}
 
 	version := "latest"
@@ -3692,6 +4206,7 @@ func (u *upgradeAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string
 	if err := json.Unmarshal(summaryResult, &summary); err != nil {
 		return nil, fmt.Errorf("failed to parse upgrade summary: %w", err)
 	}
+	summary = normalizeUpgradeSummary(summary)
 
 	// Build current state
 	currentState := map[string]interface{}{
@@ -3721,6 +4236,12 @@ func (u *upgradeAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string
 			Operation:   "start",
 			Target:      appName,
 		},
+		{
+			Step:        4,
+			Description: fmt.Sprintf("Verify the app reports RUNNING after the job finishes (waits up to %ds); otherwise the task fails with the app's state", int(healthTimeout/time.Second)),
+			Operation:   "verify",
+			Target:      appName,
+		},
 	}
 
 	result := &DryRunResult{
@@ -3737,7 +4258,7 @@ func (u *upgradeAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string
 	// Add warnings if no snapshot
 	if !snapshotHostpaths {
 		result.Warnings = []string{
-			"WARNING: snapshot_hostpaths is disabled. No backup will be created before upgrade.",
+			"WARNING: snapshot_hostpaths is disabled, so no host-path snapshot is requested. TrueNAS still stops the app and snapshots its ix-volumes dataset for rollback; data on host paths is not covered.",
 		}
 	}
 
@@ -4062,6 +4583,10 @@ func (u *updateAppDryRun) ExecuteDryRun(client *truenas.Client, args map[string]
 	}, nil
 }
 
+// maxQueryJobsLimit is the largest query_jobs limit: one below the
+// middleware's 10000-row maximum, as one extra row is requested.
+const maxQueryJobsLimit = 9999
+
 func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (string, error) {
 	state := "RUNNING"
 	if s, ok := args["state"].(string); ok && s != "" {
@@ -4069,8 +4594,8 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 	}
 
 	limit := 50
-	if l, ok := args["limit"].(float64); ok {
-		limit = int(l)
+	if l, ok := args["limit"].(float64); ok && l >= 1 {
+		limit = int(math.Min(l, maxQueryJobsLimit))
 	}
 
 	// Build query filters based on state
@@ -4084,8 +4609,11 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 	}
 
 	// Build options
+	// One row more than asked for tells whether the list was cut. limit is
+	// capped at maxQueryJobsLimit so this stays within the middleware's
+	// 10000-row maximum.
 	options := map[string]interface{}{
-		"limit":    limit,
+		"limit":    limit + 1,
 		"order_by": []string{"-time_started"}, // Most recent first
 	}
 
@@ -4097,6 +4625,24 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 	var jobs []map[string]interface{}
 	if err := json.Unmarshal(result, &jobs); err != nil {
 		return "", fmt.Errorf("failed to parse jobs: %w", err)
+	}
+	hasMore := len(jobs) > limit
+	if hasMore {
+		jobs = jobs[:limit]
+	}
+	total := len(jobs)
+	totalKnown := true
+	if hasMore {
+		// The full count is a separate cheap query; if it fails the list is
+		// still returned, flagged has_more, without a total.
+		totalKnown = false
+		if raw, err := client.Call("core.get_jobs", filters, map[string]interface{}{"count": true}); err == nil {
+			var n float64
+			if json.Unmarshal(raw, &n) == nil && int(n) >= len(jobs) {
+				total = int(n)
+				totalKnown = true
+			}
+		}
 	}
 
 	// Create simplified response with relevant fields
@@ -4114,31 +4660,60 @@ func handleQueryJobs(client *truenas.Client, args map[string]interface{}) (strin
 			jobInfo["progress"] = progress
 		}
 		if timeStarted, ok := job["time_started"]; ok && timeStarted != nil {
-			jobInfo["time_started"] = timeStarted
+			jobInfo["time_started"] = readableDates(timeStarted)
 		}
 		if timeFinished, ok := job["time_finished"]; ok && timeFinished != nil {
-			jobInfo["time_finished"] = timeFinished
+			jobInfo["time_finished"] = readableDates(timeFinished)
 		}
 		if result, ok := job["result"]; ok && result != nil {
-			jobInfo["result"] = result
+			// A job result can be a whole app entry or similar: bound it and
+			// say so when it was cut.
+			bounded, truncated, size := tasks.BoundResult(readableDates(result))
+			jobInfo["result"] = bounded
+			if truncated {
+				jobInfo["result_truncated"] = true
+				jobInfo["result_size_bytes"] = size
+			}
 		}
 		if errorMsg, ok := job["error"]; ok && errorMsg != nil {
-			jobInfo["error"] = errorMsg
+			if text, isText := errorMsg.(string); isText {
+				cut, truncated := tasks.TruncateText(text, tasks.MaxJobTextBytes)
+				jobInfo["error"] = cut
+				if truncated {
+					jobInfo["error_truncated"] = true
+				}
+			} else {
+				jobInfo["error"] = errorMsg
+			}
 		}
 		if exception, ok := job["exception"]; ok && exception != nil {
-			jobInfo["exception"] = exception
+			if text, isText := exception.(string); isText {
+				cut, truncated := tasks.TruncateText(text, tasks.MaxJobTextBytes)
+				jobInfo["exception"] = cut
+				if truncated {
+					jobInfo["exception_truncated"] = true
+				}
+			} else {
+				jobInfo["exception"] = exception
+			}
 		}
 		if abortable, ok := job["abortable"]; ok {
 			jobInfo["abortable"] = abortable
 		}
 
-		simplified = append(simplified, jobInfo)
+		// Each entry as a whole stays within tasks.MaxJobResultBytes.
+		simplified = append(simplified, tasks.FitJobSummary(jobInfo))
 	}
 
 	response := map[string]interface{}{
 		"jobs":         simplified,
 		"job_count":    len(simplified),
 		"state_filter": state,
+		"has_more":     hasMore,
+		"limit":        limit,
+	}
+	if totalKnown {
+		response["total"] = total
 	}
 
 	formatted, err := json.MarshalIndent(response, "", "  ")
@@ -4241,14 +4816,18 @@ func analyzeCPUCapacity(client *truenas.Client, timeRange string) (map[string]in
 		return nil, fmt.Errorf("no CPU metrics data available")
 	}
 
-	// Extract data points from the first metric (CPU usage)
-	dataPoints, err := extractDataPoints(metricsData[0])
-	if err != nil {
-		return nil, err
+	// Overall CPU usage is the legend series "cpu" (column 1 if the legend
+	// has none). Rows with no sample (all zero/null, as the middleware
+	// zero-fills gaps) are skipped.
+	samples := columnSamples(metricsData[0], legendColumn(metricsData[0], "cpu", 1), true, nil)
+	if len(samples) == 0 {
+		return nil, fmt.Errorf("no valid data points")
 	}
+	dataPoints := sampleValues(samples)
+	complete, partialNote := completeSamples(metricsData[0], samples)
 
-	// Calculate statistics
-	current := calculateRecentAverage(dataPoints, 5) // Last 5 points
+	// Calculate statistics; current is the last 5 complete samples.
+	current := calculateRecentAverage(sampleValues(complete), 5)
 	average := calculateAverage(dataPoints)
 	peak := calculateMax(dataPoints)
 	trend := calculateTrendDirection(dataPoints)
@@ -4262,6 +4841,9 @@ func analyzeCPUCapacity(client *truenas.Client, timeRange string) (map[string]in
 		"peak_utilization_pct":    fmt.Sprintf("%.2f", peak),
 		"trend":                   trend,
 		"capacity_status":         status,
+	}
+	if partialNote != "" {
+		analysis["partial_sample_note"] = partialNote
 	}
 
 	// Add projections if trending up
@@ -4316,45 +4898,235 @@ func analyzeMemoryCapacity(client *truenas.Client, timeRange string) (map[string
 		return nil, fmt.Errorf("no memory metrics data available")
 	}
 
-	// Extract data points (in bytes)
-	dataPoints, err := extractDataPoints(metricsData[0])
+	// Extract data points: the "memory" graph (truenas_meminfo.available)
+	// reports AVAILABLE bytes, so used = total - available.
+	mem, err := availableMemorySamples(metricsData[0])
 	if err != nil {
 		return nil, err
 	}
+	availablePoints := mem.all
 
-	// Convert to percentages
-	dataPointsPct := make([]float64, len(dataPoints))
-	for i, dp := range dataPoints {
-		dataPointsPct[i] = (dp / totalMemory) * 100
+	// Convert to used percentages
+	dataPointsPct := make([]float64, len(availablePoints))
+	for i, avail := range availablePoints {
+		dataPointsPct[i] = memoryUsedPct(totalMemory, avail)
 	}
 
+	// All current figures use one basis: the latest complete sample. Byte
+	// counts are integers first, so current_used_bytes - arc_bytes equals
+	// used_excluding_arc_bytes exactly.
+	usedBytes := int64(math.Max(0, totalMemory-mem.latest))
+	currentPct := bytesPct(usedBytes, totalMemory)
+
 	// Calculate statistics
-	current := calculateRecentAverage(dataPointsPct, 5)
 	average := calculateAverage(dataPointsPct)
 	peak := calculateMax(dataPointsPct)
 	trend := calculateTrendDirection(dataPointsPct)
-	status := determineCapacityStatus(current, 70.0, 85.0)
 
 	analysis := map[string]interface{}{
 		"metric":                  "Memory",
 		"time_range":              timeRange,
-		"current_utilization_pct": fmt.Sprintf("%.2f", current),
+		"current_utilization_pct": fmt.Sprintf("%.2f", currentPct),
 		"average_utilization_pct": fmt.Sprintf("%.2f", average),
 		"peak_utilization_pct":    fmt.Sprintf("%.2f", peak),
 		"trend":                   trend,
-		"capacity_status":         status,
 		"total_memory_bytes":      int64(totalMemory),
+		"current_available_bytes": int64(mem.latest),
+		"current_used_bytes":      usedBytes,
+		"samples_used":            len(availablePoints),
+	}
+	if mem.partialNote != "" {
+		analysis["partial_sample_note"] = mem.partialNote
 	}
 
-	// Add projections if trending up
-	if trend == "increasing" {
-		projections := calculateProjections(dataPointsPct, current, 70.0, 85.0)
-		if len(projections) > 0 {
-			analysis["projections"] = projections
+	// The ZFS ARC is reclaimable cache that the available figure does not
+	// count, so status is based on memory used excluding the ARC. Only the
+	// latest ARC size is known, so it is compared with the latest complete
+	// available sample rather than an average over the range.
+	statusPct := currentPct
+	arcBytes, arcFreshKnown, arcErr := currentArcBytes(client, nasReferenceTime(metricsData[0]))
+	if arcErr == nil {
+		if !arcFreshKnown {
+			analysis["arc_freshness_note"] = arcFreshnessUnknownNote
+		}
+		arc := int64(arcBytes)
+		usedExclArc := usedBytes - arc
+		if usedExclArc < 0 {
+			usedExclArc = 0
+			analysis["arc_clamped"] = true
+			analysis["clamp_note"] = "ZFS ARC size exceeds memory used, so used_excluding_arc_bytes was clamped to 0; the ARC and memory samples may be from different times."
+		}
+		statusPct = bytesPct(usedExclArc, totalMemory)
+		analysis["arc_bytes"] = arc
+		analysis["used_excluding_arc_bytes"] = usedExclArc
+		analysis["utilization_excluding_arc_pct"] = fmt.Sprintf("%.2f", statusPct)
+		// The headline figure matches capacity_status: excluding the ARC.
+		analysis["current_utilization_pct"] = fmt.Sprintf("%.2f", statusPct)
+		analysis["current_utilization_including_arc_pct"] = fmt.Sprintf("%.2f", currentPct)
+		analysis["current_utilization_basis"] = "excluding_arc"
+		analysis["utilization_basis"] = "used = total_memory_bytes - available (reporting graph 'memory'). current_used_bytes, current_available_bytes, current_utilization_including_arc_pct, used_excluding_arc_bytes, current_utilization_pct and capacity_status all use the latest complete sample; current_utilization_pct and capacity_status subtract the latest ZFS ARC size (arcsize), which is reclaimable cache. average_utilization_pct, peak_utilization_pct and trend include the ARC."
+		// Only the latest ARC size is known, not its history, so a trend
+		// excluding the ARC can't be computed. Projecting the ARC-inclusive
+		// trend would report ARC growth as a threshold risk, so none is given.
+		if trend == "increasing" {
+			analysis["projection_note"] = "No threshold projection: the trend includes the ZFS ARC, which grows as the cache warms, while capacity_status excludes it."
+		}
+	} else {
+		analysis["utilization_basis"] = "used = total_memory_bytes - available (reporting graph 'memory' reports available memory). current_used_bytes, current_available_bytes, current_utilization_pct and capacity_status use the latest complete sample; all figures may include the ZFS ARC"
+		analysis["current_utilization_basis"] = "including_arc"
+		analysis["note"] = arcUnavailableNote(arcErr)
+		// Status and trend are both ARC-inclusive here, so projecting is consistent.
+		if trend == "increasing" {
+			if projections := calculateProjections(dataPointsPct, statusPct, 70.0, 85.0); len(projections) > 0 {
+				analysis["projections"] = projections
+			}
 		}
 	}
+	analysis["capacity_status"] = determineCapacityStatus(statusPct, 70.0, 85.0)
 
 	return analysis, nil
+}
+
+// availableMemory holds the available-memory samples of a "memory" graph.
+type availableMemory struct {
+	all         []float64 // every valid sample, oldest first
+	latest      float64   // latest complete sample (latest sample if all are partial)
+	partialNote string    // completeSamples note about a partial last bucket
+}
+
+// availableMemorySamples returns the available-memory samples of a
+// "memory" graph, skipping gaps: null, non-finite and non-positive values
+// (a running system never has zero available memory).
+func availableMemorySamples(metric map[string]interface{}) (availableMemory, error) {
+	if _, ok := metric["data"].([]interface{}); !ok {
+		return availableMemory{}, fmt.Errorf("no data field in metric")
+	}
+	samples := columnSamples(metric, 1, false, func(v float64) bool { return v > 0 })
+	if len(samples) == 0 {
+		return availableMemory{}, fmt.Errorf("no valid data points")
+	}
+	complete, note := completeSamples(metric, samples)
+	return availableMemory{
+		all:         sampleValues(samples),
+		latest:      complete[len(complete)-1].v,
+		partialNote: note,
+	}, nil
+}
+
+// bytesPct is used as a percentage of total, clamped to 0-100.
+func bytesPct(used int64, total float64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return math.Max(0, math.Min(100, float64(used)/total*100))
+}
+
+// arcMaxAge is how old the latest arcsize sample may be, relative to the
+// NAS's own reference time, before it is treated as unavailable rather than
+// compared with current memory figures.
+const arcMaxAge = 15 * time.Minute
+
+// errArcStale reports that the latest arcsize sample is older than arcMaxAge.
+var errArcStale = errors.New("latest ZFS ARC sample is stale")
+
+// nasReferenceTime returns the newest timestamp in a reporting.get_data
+// graph, in the NAS's clock: the later of the graph's "end" and its newest
+// sample with a value. It returns 0 when neither is present.
+func nasReferenceTime(graph map[string]interface{}) float64 {
+	ref := 0.0
+	if graph == nil {
+		return ref
+	}
+	if end, ok := graph["end"].(float64); ok && end > ref && !math.IsInf(end, 0) {
+		ref = end
+	}
+	rows, _ := graph["data"].([]interface{})
+	for i := len(rows) - 1; i >= 0; i-- {
+		row, ok := rows[i].([]interface{})
+		if !ok || len(row) < 2 {
+			continue
+		}
+		if val, ok := row[1].(float64); !ok || math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
+			continue // gap
+		}
+		if ts, ok := row[0].(float64); ok && ts > ref && !math.IsInf(ts, 0) {
+			ref = ts
+		}
+		break
+	}
+	return ref
+}
+
+// currentArcBytes returns the latest ZFS ARC size from the "arcsize"
+// reporting graph. Its age is judged only against timestamps from the NAS
+// itself, never this host's clock, so clock skew between the two does not
+// matter: the reference is the later of memRef (the newest timestamp of a
+// graph the caller fetched from the same NAS, 0 if none) and the arcsize
+// graph's "end". A sample more than arcMaxAge older than the
+// reference yields errArcStale. With no reference at all, freshness is
+// unknown: the sample is returned with freshKnown false.
+func currentArcBytes(client *truenas.Client, memRef float64) (bytes float64, freshKnown bool, err error) {
+	result, err := client.Call("reporting.get_data", []interface{}{
+		map[string]interface{}{"name": "arcsize", "identifier": nil},
+	}, map[string]interface{}{"unit": "HOUR"})
+	if err != nil {
+		return 0, false, err
+	}
+	var data []map[string]interface{}
+	if err := json.Unmarshal(result, &data); err != nil {
+		return 0, false, err
+	}
+	if len(data) == 0 {
+		return 0, false, fmt.Errorf("no arcsize data")
+	}
+	// Only the graph's "end" counts here: the ARC sample can't vouch for its
+	// own freshness.
+	ref := memRef
+	if end, ok := data[0]["end"].(float64); ok && end > ref && !math.IsInf(end, 0) {
+		ref = end
+	}
+	rows, _ := data[0]["data"].([]interface{})
+	for i := len(rows) - 1; i >= 0; i-- {
+		row, ok := rows[i].([]interface{})
+		if !ok || len(row) < 2 {
+			continue
+		}
+		val, ok := row[1].(float64)
+		if !ok || math.IsNaN(val) || math.IsInf(val, 0) || val <= 0 {
+			continue // gap
+		}
+		ts, ok := row[0].(float64)
+		if !ok || ts <= 0 || ref <= 0 {
+			return val, false, nil
+		}
+		if ref-ts > arcMaxAge.Seconds() {
+			return 0, false, errArcStale
+		}
+		return val, true, nil
+	}
+	return 0, false, fmt.Errorf("no arcsize data")
+}
+
+// arcFreshnessUnknownNote is the caveat given when the ARC sample was used
+// but its age could not be checked.
+const arcFreshnessUnknownNote = "The TrueNAS reporting data had no reference timestamp, so the age of the ZFS ARC sample could not be checked; it was used as is."
+
+// arcUnavailableNote explains why memory figures may include the ARC.
+func arcUnavailableNote(err error) string {
+	if errors.Is(err, errArcStale) {
+		return "Latest ZFS ARC sample is more than 15 minutes older than the newest TrueNAS reporting timestamp, so it was not subtracted; utilization may include the ZFS ARC cache, which is reclaimable."
+	}
+	return "ZFS ARC size unavailable; utilization may include the ZFS ARC cache, which is reclaimable."
+}
+
+// memoryUsedPct converts an available-memory sample into percent used,
+// clamped to 0-100.
+func memoryUsedPct(total, available float64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	pct := (total - available) / total * 100
+	return math.Max(0, math.Min(100, pct))
 }
 
 func analyzeNetworkCapacity(client *truenas.Client, timeRange string) (map[string]interface{}, error) {
@@ -4409,53 +5181,63 @@ func analyzeNetworkCapacity(client *truenas.Client, timeRange string) (map[strin
 		}
 
 		// Analyze both TX and RX
-		ifaceInfo := make(map[string]interface{})
+		ifaceInfo := map[string]interface{}{"time_range": timeRange}
 		if linkSpeed > 0 {
 			ifaceInfo["link_speed_mbps"] = linkSpeed
 		}
 
+		// Each series (legend "received", "sent") is analysed separately.
+		// The "interface" graph is in Kilobits/s.
+		ifaceInfo["unit_source"] = "reporting graph 'interface' (" + reportingUnits["interface"] + "), converted to Mbps"
 		for _, metric := range metricsData {
-			legend, _ := metric["legend"].(string)
-			dataPoints, err := extractDataPoints(metric)
-			if err != nil {
-				continue
+			legend := legendNames(metric)
+			for col := 1; col < len(legend); col++ {
+				samples := columnSamples(metric, col, false, nil)
+				if len(samples) == 0 || legend[col] == "" {
+					continue
+				}
+				for i := range samples {
+					samples[i].v = math.Abs(samples[i].v) / 1000.0
+				}
+				complete, note := completeSamples(metric, samples)
+				if note != "" {
+					ifaceInfo["partial_sample_note"] = note
+				}
+				ifaceInfo[legend[col]] = networkSeriesInfo(sampleValues(samples), sampleValues(complete), linkSpeed)
 			}
-
-			// Convert bits/s to Mbps for comparison with link speed
-			dataPointsMbps := make([]float64, len(dataPoints))
-			for i, dp := range dataPoints {
-				dataPointsMbps[i] = dp / 1000000.0
-			}
-
-			current := calculateRecentAverage(dataPointsMbps, 5)
-			average := calculateAverage(dataPointsMbps)
-			peak := calculateMax(dataPointsMbps)
-
-			metricInfo := map[string]interface{}{
-				"current_mbps": fmt.Sprintf("%.2f", current),
-				"average_mbps": fmt.Sprintf("%.2f", average),
-				"peak_mbps":    fmt.Sprintf("%.2f", peak),
-			}
-
-			// Calculate utilization percentage if we have link speed
-			if linkSpeed > 0 {
-				currentPct := (current / linkSpeed) * 100
-				avgPct := (average / linkSpeed) * 100
-				peakPct := (peak / linkSpeed) * 100
-
-				metricInfo["current_utilization_pct"] = fmt.Sprintf("%.2f", currentPct)
-				metricInfo["average_utilization_pct"] = fmt.Sprintf("%.2f", avgPct)
-				metricInfo["peak_utilization_pct"] = fmt.Sprintf("%.2f", peakPct)
-				metricInfo["capacity_status"] = determineCapacityStatus(currentPct, 70.0, 85.0)
-			}
-
-			ifaceInfo[legend] = metricInfo
 		}
 
 		interfaceAnalysis[ifaceName] = ifaceInfo
 	}
 
 	return interfaceAnalysis, nil
+}
+
+// networkSeriesInfo summarizes one interface series in Mbps, with
+// utilization against linkSpeed (Mbps) when known. current_mbps is the
+// mean of the last 5 complete samples (completeMbps excludes a partial
+// last bucket); average and peak use every sample.
+func networkSeriesInfo(dataPointsMbps, completeMbps []float64, linkSpeed float64) map[string]interface{} {
+	current := calculateRecentAverage(completeMbps, 5)
+	average := calculateAverage(dataPointsMbps)
+	peak := calculateMax(dataPointsMbps)
+
+	metricInfo := map[string]interface{}{
+		"current_mbps": fmt.Sprintf("%.2f", current),
+		"average_mbps": fmt.Sprintf("%.2f", average),
+		"peak_mbps":    fmt.Sprintf("%.2f", peak),
+	}
+
+	// Calculate utilization percentage if we have link speed
+	if linkSpeed > 0 {
+		currentPct := (current / linkSpeed) * 100
+		metricInfo["current_utilization_pct"] = fmt.Sprintf("%.2f", currentPct)
+		metricInfo["average_utilization_pct"] = fmt.Sprintf("%.2f", average/linkSpeed*100)
+		metricInfo["peak_utilization_pct"] = fmt.Sprintf("%.2f", peak/linkSpeed*100)
+		metricInfo["capacity_status"] = determineCapacityStatus(currentPct, 70.0, 85.0)
+	}
+
+	return metricInfo
 }
 
 func analyzeDiskCapacity(client *truenas.Client, timeRange string) (map[string]interface{}, error) {
@@ -4521,28 +5303,32 @@ func analyzeDiskCapacity(client *truenas.Client, timeRange string) (map[string]i
 			continue
 		}
 
-		// Analyze I/O metrics (read/write operations and throughput)
-		diskInfo := make(map[string]interface{})
+		// Analyze throughput per series (legend "reads", "writes"). The
+		// "disk" graph is in Kibibytes/s.
+		// current is the mean of the last 5 complete samples.
+		diskInfo := map[string]interface{}{"unit": reportingUnits["disk"], "time_range": timeRange}
 		for _, metric := range metricsData {
-			legend, _ := metric["legend"].(string)
-			dataPoints, err := extractDataPoints(metric)
-			if err != nil {
-				continue
+			legend := legendNames(metric)
+			for col := 1; col < len(legend); col++ {
+				samples := columnSamples(metric, col, false, nil)
+				if len(samples) == 0 || legend[col] == "" {
+					continue
+				}
+				for i := range samples {
+					samples[i].v = math.Abs(samples[i].v)
+				}
+				complete, note := completeSamples(metric, samples)
+				if note != "" {
+					diskInfo["partial_sample_note"] = note
+				}
+				dataPoints := sampleValues(samples)
+				diskInfo[legend[col]] = map[string]interface{}{
+					"current": fmt.Sprintf("%.2f", calculateRecentAverage(sampleValues(complete), 5)),
+					"average": fmt.Sprintf("%.2f", calculateAverage(dataPoints)),
+					"peak":    fmt.Sprintf("%.2f", calculateMax(dataPoints)),
+					"trend":   calculateTrendDirection(dataPoints),
+				}
 			}
-
-			current := calculateRecentAverage(dataPoints, 5)
-			average := calculateAverage(dataPoints)
-			peak := calculateMax(dataPoints)
-			trend := calculateTrendDirection(dataPoints)
-
-			metricInfo := map[string]interface{}{
-				"current": fmt.Sprintf("%.2f", current),
-				"average": fmt.Sprintf("%.2f", average),
-				"peak":    fmt.Sprintf("%.2f", peak),
-				"trend":   trend,
-			}
-
-			diskInfo[legend] = metricInfo
 		}
 
 		diskAnalysis[diskName] = diskInfo
@@ -4618,28 +5404,6 @@ func handleGetPoolCapacityDetails(client *truenas.Client, args map[string]interf
 }
 
 // Helper functions for capacity analysis
-
-func extractDataPoints(metric map[string]interface{}) ([]float64, error) {
-	dataRaw, ok := metric["data"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("no data field in metric")
-	}
-
-	dataPoints := make([]float64, 0, len(dataRaw))
-	for _, pointRaw := range dataRaw {
-		if point, ok := pointRaw.([]interface{}); ok && len(point) >= 2 {
-			if val, ok := point[1].(float64); ok {
-				dataPoints = append(dataPoints, val)
-			}
-		}
-	}
-
-	if len(dataPoints) == 0 {
-		return nil, fmt.Errorf("no valid data points")
-	}
-
-	return dataPoints, nil
-}
 
 func calculateAverage(values []float64) float64 {
 	if len(values) == 0 {
@@ -4799,10 +5563,10 @@ func generateCapacityRecommendations(analysis map[string]interface{}) map[string
 			overallStatuses = append(overallStatuses, status)
 			if status == "warning" {
 				recommendations = append(recommendations,
-					"Memory utilization is elevated (>70%). Consider adding more RAM or optimizing memory usage.")
+					"Memory utilization (excluding ZFS ARC cache when known) is elevated (>70%). Consider adding more RAM or optimizing memory usage.")
 			} else if status == "critical" {
 				recommendations = append(recommendations,
-					"Memory utilization is critical (>85%). Immediate action recommended: add more RAM or reduce workload.")
+					"Memory utilization (excluding ZFS ARC cache when known) is critical (>85%). Immediate action recommended: add more RAM or reduce workload.")
 			}
 		}
 	}
@@ -4969,7 +5733,7 @@ func (r *Registry) handleTasksList(client *truenas.Client, args map[string]inter
 	}
 
 	limit := 50
-	if l, ok := args["limit"].(float64); ok {
+	if l, ok := args["limit"].(float64); ok && l >= 1 {
 		limit = int(l)
 	}
 
@@ -5049,8 +5813,10 @@ func handleUpdateStatus(client *truenas.Client, args map[string]interface{}) (st
 
 // handleDownloadUpdate downloads a TrueNAS system update
 func (r *Registry) handleDownloadUpdate(client *truenas.Client, args map[string]interface{}) (string, error) {
-	train, _ := args["train"].(string)
-	version, _ := args["version"].(string)
+	// train and version are declared for compatibility but ignored:
+	// update.download takes no parameters and fetches whatever the system's
+	// configured train offers. Nothing below reports them as applied.
+	ignored := downloadUpdateIgnoredNote(args)
 
 	// Check if update is already downloaded
 	statusResult, err := client.Call("update.status")
@@ -5061,18 +5827,17 @@ func (r *Registry) handleDownloadUpdate(client *truenas.Client, args map[string]
 			if progress, ok := status["update_download_progress"].(map[string]interface{}); ok {
 				if percent, ok := progress["percent"].(float64); ok && percent == 100 {
 					if dlVersion, ok := progress["version"].(string); ok {
-						// If no specific version requested, or versions match
-						if version == "" || dlVersion == version {
-							response := map[string]interface{}{
-								"train":              train,
-								"version":            dlVersion,
-								"already_downloaded": true,
-								"download_percent":   100,
-								"message":            fmt.Sprintf("Update %s is already downloaded (100%%). Ready to apply.", dlVersion),
-							}
-							formatted, _ := json.MarshalIndent(response, "", "  ")
-							return string(formatted), nil
+						response := map[string]interface{}{
+							"version":            dlVersion,
+							"already_downloaded": true,
+							"download_percent":   100,
+							"message":            fmt.Sprintf("Update %s is already downloaded (100%%). Ready to apply.", dlVersion),
 						}
+						if ignored != "" {
+							response["warning"] = ignored
+						}
+						formatted, _ := json.MarshalIndent(response, "", "  ")
+						return string(formatted), nil
 					}
 				}
 			}
@@ -5095,7 +5860,7 @@ func (r *Registry) handleDownloadUpdate(client *truenas.Client, args map[string]
 	// Create task to track download progress
 	task, err := r.taskManager.CreateJobTask(
 		"download_update",
-		args,
+		withoutKeys(args, "train", "version"),
 		jobID,
 		2*time.Hour, // 2 hour TTL
 	)
@@ -5104,13 +5869,14 @@ func (r *Registry) handleDownloadUpdate(client *truenas.Client, args map[string]
 	}
 
 	response := map[string]interface{}{
-		"train":         train,
-		"version":       version,
 		"task_id":       task.TaskID,
 		"task_status":   task.Status,
 		"poll_interval": task.PollInterval,
 		"job_id":        jobID,
 		"message":       fmt.Sprintf("Update download started. Track progress with tasks_get using task_id: %s", task.TaskID),
+	}
+	if ignored != "" {
+		response["warning"] = ignored
 	}
 
 	formatted, err := json.MarshalIndent(response, "", "  ")
@@ -5130,9 +5896,6 @@ func (r *Registry) handleDownloadUpdateWithDryRun(client *truenas.Client, args m
 type downloadUpdateDryRun struct{}
 
 func (d *downloadUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[string]interface{}) (*DryRunResult, error) {
-	train, _ := args["train"].(string)
-	version, _ := args["version"].(string)
-
 	// Get current system info
 	sysInfoResult, err := client.Call("system.info")
 	if err != nil {
@@ -5144,7 +5907,10 @@ func (d *downloadUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[st
 		return nil, fmt.Errorf("failed to parse system info: %w", err)
 	}
 
-	currentVersion := sysInfo["version"].(string)
+	currentVersion, ok := sysInfo["version"].(string)
+	if !ok || currentVersion == "" {
+		return nil, fmt.Errorf("system.info returned no usable version")
+	}
 
 	actions := []PlannedAction{
 		{
@@ -5155,19 +5921,15 @@ func (d *downloadUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[st
 		},
 		{
 			Step:        2,
-			Description: fmt.Sprintf("Download update files for version %s", version),
+			Description: "Download the update offered by the system's configured update train",
 			Operation:   "download",
-			Target:      version,
-			Details: map[string]interface{}{
-				"train":   train,
-				"version": version,
-			},
+			Target:      "configured update train",
 		},
 		{
 			Step:        3,
 			Description: "Verify update package integrity",
 			Operation:   "verify",
-			Target:      version,
+			Target:      "downloaded update",
 		},
 	}
 
@@ -5183,8 +5945,34 @@ func (d *downloadUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[st
 			Note:       "Time varies based on update size and network speed",
 		},
 	}
+	if note := downloadUpdateIgnoredNote(args); note != "" {
+		result.Warnings = append(result.Warnings, note)
+	}
 
 	return result, nil
+}
+
+// downloadUpdateIgnoredNote explains that train and version had no effect,
+// or returns "" when neither was supplied.
+func downloadUpdateIgnoredNote(args map[string]interface{}) string {
+	_, hasTrain := args["train"]
+	_, hasVersion := args["version"]
+	if !hasTrain && !hasVersion {
+		return ""
+	}
+	return "train and version were ignored: the download always fetches the update offered by the system's configured update train"
+}
+
+// withoutKeys returns a copy of args without the named keys.
+func withoutKeys(args map[string]interface{}, keys ...string) map[string]interface{} {
+	out := make(map[string]interface{}, len(args))
+	for k, v := range args {
+		out[k] = v
+	}
+	for _, k := range keys {
+		delete(out, k)
+	}
+	return out
 }
 
 // handleApplyUpdate applies a downloaded TrueNAS system update
@@ -5268,7 +6056,10 @@ func (a *applyUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[strin
 		return nil, fmt.Errorf("failed to parse system info: %w", err)
 	}
 
-	currentVersion := sysInfo["version"].(string)
+	currentVersion, ok := sysInfo["version"].(string)
+	if !ok || currentVersion == "" {
+		return nil, fmt.Errorf("system.info returned no usable version")
+	}
 
 	// Check update status to get target version
 	statusResult, err := client.Call("update.status")
@@ -5348,7 +6139,15 @@ func (a *applyUpdateDryRun) ExecuteDryRun(client *truenas.Client, args map[strin
 func handleSystemReboot(client *truenas.Client, args map[string]interface{}) (string, error) {
 	// Call system.reboot with reason parameter
 	reason := "System reboot requested via MCP"
-	result, err := client.Call("system.reboot", reason)
+	params := []interface{}{reason}
+	delay, err := rebootDelay(args)
+	if err != nil {
+		return "", err
+	}
+	if delay > 0 {
+		params = append(params, map[string]interface{}{"delay": delay})
+	}
+	result, err := client.Call("system.reboot", params...)
 	if err != nil {
 		return "", fmt.Errorf("failed to initiate system reboot: %w", err)
 	}
@@ -5363,6 +6162,10 @@ func handleSystemReboot(client *truenas.Client, args map[string]interface{}) (st
 		"status":  "reboot_initiated",
 		"message": "System reboot initiated. All connections will be lost.",
 		"warning": "TrueNAS system is rebooting. Wait approximately 2-3 minutes before reconnecting.",
+	}
+	if delay > 0 {
+		returnMsg["delay_seconds"] = delay
+		returnMsg["message"] = fmt.Sprintf("System reboot scheduled in %d seconds. All connections will be lost.", delay)
 	}
 
 	formatted, err := json.MarshalIndent(returnMsg, "", "  ")
@@ -5397,7 +6200,7 @@ func handleQueryBootEnvironments(client *truenas.Client, args map[string]interfa
 	}
 
 	limit := 50
-	if l, ok := args["limit"].(float64); ok {
+	if l, ok := args["limit"].(float64); ok && l >= 1 {
 		limit = int(l)
 	}
 
@@ -5611,7 +6414,7 @@ func handleGetCurrentBootEnvironment(client *truenas.Client, args map[string]int
 
 func simplifyBootEnvironment(env map[string]interface{}) map[string]interface{} {
 	id, _ := env["id"].(string)
-	created, _ := env["created"].(string)
+	created, createdTimestamp := parseBootEnvCreated(env["created"])
 	usedBytes, _ := env["used_bytes"].(float64)
 	active, _ := env["active"].(bool)
 	activated, _ := env["activated"].(bool)
@@ -5619,14 +6422,6 @@ func simplifyBootEnvironment(env map[string]interface{}) map[string]interface{} 
 	canActivate, _ := env["can_activate"].(bool)
 
 	sizeBytes := int64(usedBytes)
-
-	// Parse created timestamp
-	var createdTimestamp int64
-	if created != "" {
-		if t, err := time.Parse(time.RFC3339, created); err == nil {
-			createdTimestamp = t.Unix()
-		}
-	}
 
 	// Determine if deletable
 	deletable := !active && !activated && !keep
@@ -5658,6 +6453,13 @@ func simplifyBootEnvironment(env map[string]interface{}) map[string]interface{} 
 	}
 
 	return simplified
+}
+
+// parseBootEnvCreated normalizes a boot environment's "created" value and
+// returns it as an ISO-8601 UTC string plus Unix seconds; see mwtime.Normalize
+// for the accepted forms and the 2000..now+10y range.
+func parseBootEnvCreated(v interface{}) (string, int64) {
+	return mwtime.Normalize(v)
 }
 
 func sortBootEnvironments(envs []map[string]interface{}, orderBy string) {
