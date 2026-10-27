@@ -110,3 +110,19 @@ func TestHandleAppLogsRequiresAppName(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleAppLogsRejectsInvalidTailBeforeAPI(t *testing.T) {
+	for _, v := range []interface{}{0.0, 1.5, float64(maxLogTail + 1), "10"} {
+		if _, err := handleAppLogs(nil, map[string]interface{}{"app_name": "x", "tail_lines": v}); err == nil || !strings.Contains(err.Error(), "tail_lines") {
+			t.Errorf("tail_lines=%v: err=%v", v, err)
+		}
+	}
+}
+
+func TestSortContainers(t *testing.T) {
+	c := []map[string]interface{}{{"service_name": "web", "id": "b"}, {"service_name": "db", "id": "c"}, {"service_name": "web", "id": "a"}}
+	sortContainers(c)
+	if c[0]["id"] != "c" || c[1]["id"] != "a" || c[2]["id"] != "b" {
+		t.Fatalf("unexpected order: %v", c)
+	}
+}

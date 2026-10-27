@@ -29,13 +29,13 @@ func (c *Client) JobLogs(id int) ([]byte, error) {
 
 // downloadLog accepts only same-host download paths and never returns token-bearing errors.
 func (c *Client) downloadLog(path string) ([]byte, error) {
-	urls, err := c.buildConnectionURLs()
+	base, err := c.endpointURL()
 	if err != nil {
 		return nil, err
 	}
-	base, err := url.Parse(urls[0])
+	proxy, err := c.proxyFor(base)
 	if err != nil {
-		return nil, fmt.Errorf("invalid TrueNAS endpoint")
+		return nil, err
 	}
 	ref, err := url.Parse(path)
 	if err != nil || ref.IsAbs() || ref.Host != "" || ref.User != nil || ref.Fragment != "" || !strings.HasPrefix(ref.Path, "/_download/") || pathpkg.Clean(ref.Path) != ref.Path || strings.Contains(ref.Path, "\\") {
@@ -43,6 +43,9 @@ func (c *Client) downloadLog(path string) ([]byte, error) {
 	}
 	base.Scheme = "https"
 	transport := &http.Transport{TLSClientConfig: c.tlsConfig}
+	if proxy != nil {
+		transport.Proxy = http.ProxyURL(dialerProxy(proxy.url))
+	}
 	defer transport.CloseIdleConnections()
 	httpClient := &http.Client{
 		Transport: transport, Timeout: 60 * time.Second,

@@ -2,12 +2,20 @@
 
 This document provides a comprehensive list of all available MCP tools for TrueNAS management.
 
+Tools are classified as read, write or destructive (`tools/safety.go`). Write and destructive tools are hidden and refused in `--read-only` mode, and `--allow-tools` / `--deny-tools` restrict the exposed set. Destructive tools (marked below) require `confirm: true` to execute; without it they return a `confirmation_required` result with their dry-run preview. **Breaking change:** callers that used these nine tools without `confirm` now get the preview instead. See [Safety Controls](../README.md#safety-controls).
+
 ## Read-Only Monitoring Tools
 
 ### System Information
 - **system_info** - Get system information (version, hostname, platform)
+  - Datetimes (`buildtime`, `boottime`, `datetime`) are ISO-8601 UTC strings (e.g. `"2026-01-01T00:00:00Z"`) instead of the middleware's `{"$date": <ms>}` objects. Values outside 2000-01-01..now+10 years are passed through raw
 - **system_health** - Check system health including alerts, active jobs, and capacity warnings
-- **query_jobs** - Query system jobs (running, pending, or completed tasks like replication, snapshots, scrubs)
+  - `alerts` lists only active (not dismissed) alerts. `alert_count` counts them; `critical_alert_count` counts active CRITICAL/ALERT/EMERGENCY alerts and `dismissed_alert_count` dismissed ones, which are not listed (use `list_alerts` to see them)
+  - The memory warning is based on memory used excluding the ZFS ARC (latest complete available sample minus the latest ARC size) when the ARC size is known; otherwise it says the figure may include the ARC. If the ARC size was used but its age could not be checked (no timestamp in the reporting data), `arc_freshness_note` says so, as in `analyze_capacity`
+  - Alert datetimes are ISO-8601 UTC strings, as in `list_alerts`
+  - The CPU check uses the legend series `cpu` (column 1 if absent) and skips samples without data (all-zero rows, see `get_system_metrics`)
+- **query_jobs** - Query system jobs (running, pending, or completed tasks like replication, snapshots, scrubs). Reports `has_more` and `total` when the list was cut by `limit` (default 50); each entry is at most 4 KiB
+  - `time_started` and `time_finished` are ISO-8601 UTC strings (same rules as `system_info`)
 
 ### Storage Management
 - **query_pools** - Query storage pools with status and capacity
@@ -20,11 +28,14 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Perfect for questions like "what datasets use the most space?" or "show me encrypted datasets"
 
 - **query_snapshots** - Query ZFS snapshots with intelligent filtering and sorting
-  - Returns simplified snapshot information with creation date, dataset, and holds status
-  - Filter by dataset name, pool name, or holds presence
-  - Sort by snapshot name (default, newest first), dataset, or parsed creation date
+  - Returns simplified snapshot information with creation time, sizes and dataset; holds with `include_holds` or `holds_only`
+  - Requests the ZFS `creation`, `used` and `referenced` properties explicitly (`extra.properties`), since TrueNAS 27.0 does not return them by default
+  - Holds (`holds`, `holds_count`) are requested (`extra.holds`) only when `include_holds` or `holds_only` is true, because the middleware looks them up once per snapshot. `holds_included` says whether they were requested; without it, snapshots show no holds even if they have some
+  - `created` (ISO-8601 UTC) and `created_timestamp` (Unix seconds) come from the `creation` property; if it is missing, `created_date` is parsed from the snapshot name. `created_source` is `zfs_property` or `snapshot_name`
+  - `used_bytes`/`used` (space unique to the snapshot) and `referenced_bytes`/`referenced` (data it refers to), raw and human-readable
+  - Filter by dataset name, pool name, or holds presence (on 27.0 the middleware reports only its own `truenas` hold)
+  - Sort by snapshot name (default, newest first), dataset, or creation time (`created`: newest first by `created_timestamp`, then `created_date`, then name)
   - Limit results for manageable responses (default: 50, configurable)
-  - Shows snapshot names, parent datasets, creation dates (parsed from names), and holds
   - Perfect for questions like "what recent snapshots exist?" or "show snapshots with holds"
 
 - **query_shares** - Query SMB and NFS share configurations
@@ -35,20 +46,34 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Filter by VM name (partial match), state (RUNNING/STOPPED), or autostart setting
   - Sort by name (default, alphabetical), memory usage, or status (running first)
   - Shows CPU/memory config, bootloader, devices (disks, NICs, displays), and current state
+  - CPU: `sockets` (the API's `vcpus`), `cores_per_socket` (`cores`), `threads_per_core` (`threads`) and `total_vcpus` (their product, what the guest sees; a missing value counts as 1, the schema default)
+  - Memory: `memory_mib` (the API value, in MiB), `memory_gib` (e.g. `"4.0 GiB"`; two decimals below 1 GiB, e.g. `"0.50 GiB"`) and `min_memory_mib` when set. These replace `vcpus`/`cores`/`threads` and `memory_mb`/`memory_gb`
   - Automatically excludes sensitive data like display passwords for security
   - Perfect for questions like "what VMs are running?" or "show VMs with autostart enabled"
 
 ### Alerts
 - **list_alerts** - List system alerts with filtering
-- **dismiss_alert** / **restore_alert** - Manage system alerts
+  - `datetime`, `last_occurrence` and other datetimes are ISO-8601 UTC strings
+- **dismiss_alert** / **restore_alert** - Manage system alerts (write operations; support dry-run mode)
 
 ### Performance Metrics
 - **get_system_metrics** - Get CPU, memory, and load performance metrics
+  - Each graph has a `unit` (`%CPU`, `Bytes` of available memory, `Load`, `Celsius`, `Seconds`)
+  - TrueNAS fills periods without data with zeros (common for MONTH/YEAR). Rows whose values are all 0 or null are treated as gaps: they are left out of `data_sample`, and when there are any, `aggregations` is recomputed without them (the middleware's values are kept in `aggregations_reported`) and `gap_samples_excluded`, `data_points_valid` and `gap_note` are added. `data_points_total` counts all rows. A genuine all-zero sample (e.g. zero load) is also treated as a gap
+  - For `cputemp` and `disktemp`, whose middleware aggregations already skip every zero value (`skip_zero_values_in_aggregation`), `aggregations` is kept as reported; gap rows are still left out of `data_sample`
+  - `last_sample_after_end_seconds` appears when the newest sample is stamped after the graph's `end`. That sample is a partial bucket: netdata averages samples into aligned buckets stamped by their end, so for long ranges the last bucket can lie past `end` (about 2 minutes has been seen for MONTH) and cover only part of its interval. `get_system_metrics` returns it raw, in `data_sample` and `aggregations`; `analyze_capacity` skips it for current figures
 - **get_network_metrics** - Get network interface traffic metrics
+  - `unit` is `Kilobits/s` (series `received` and `sent`)
 - **get_disk_metrics** - Get disk I/O performance metrics
+  - `unit` is the graph's `vertical_label` from `reporting.graphs` (`Kibibytes/s` for `disk`, series `reads` and `writes`)
+- **get_arc_metrics** - Get ZFS ARC reporting metrics (e.g. `arcsize`)
+  - The ARC graphs available depend on the TrueNAS version; the default is every ARC graph the server supports, discovered from `core.get_methods` and `reporting.graphs` (falls back to `arcsize`)
+  - A graph that fails is reported under `errors.<graph>` while the others are returned; if every graph fails the call is an error
 
 ### Applications
-- **query_apps** - List installed applications with status and available updates
+- **query_apps** - List installed applications with status, `human_version`, and `upgrade_available` (whether an upgrade exists) and `latest_version` (newest catalog version, always set, in catalog form rather than `human_version` form)
+- **app_containers** - List an app's containers, including stopped and crashed containers
+- **app_logs** - Read up to 5000 recent log entries per container; output chunks are returned as TrueNAS emits them
 - **search_app_catalog** - Search TrueNAS app catalog by name, category, or keyword
   - Search across all catalog trains (stable, enterprise, community)
   - Filter by category (media, productivity, database, etc.)
@@ -68,6 +93,13 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Trend detection (increasing/stable/decreasing)
   - Capacity status warnings (healthy/warning/critical at 70%/85% thresholds)
   - Growth projections when metrics are trending upward
+  - The default time range is MONTH (about 30 days), unlike `get_system_metrics`, `get_network_metrics` and `get_disk_metrics`, which default to HOUR. The range used is given as `time_range` in the CPU and memory sections and in each interface and disk entry
+  - "Current" figures use complete samples only. A sample stamped after the graph's `end` is a partial bucket (the same sample `get_system_metrics` returns raw and flags with `last_sample_after_end_seconds`): it is skipped for current figures and `partial_sample_note` is added; it still counts toward average, peak and trend. If every sample is past `end`, they are used as they are and `partial_sample_note` says the current figures come from a partial bucket. CPU, network and disk `current` values are the mean of the last 5 complete samples; memory uses the latest complete sample
+  - CPU: the legend series `cpu` (column 1 if absent); samples without data (all-zero rows) are skipped
+  - Network: per interface, `received` and `sent` are analysed separately (`current_mbps`, `average_mbps`, `peak_mbps`, utilization against `link_speed_mbps`), converted from the graph's Kilobits/s. TrueNAS 27.0 interfaces report no `link_speed`, so on 27.0 there is no `link_speed_mbps` and the `*_utilization_pct` and `capacity_status` fields are absent
+  - Disk: per disk, `reads` and `writes` in `Kibibytes/s` (`unit`, the same spelling as `get_disk_metrics`)
+  - Network and disk samples are not gap-filtered: zero is a real value for traffic, so periods TrueNAS zero-fills (common for MONTH and longer) count as zero traffic and can lower `average`, `current` and `trend`
+  - Memory: used = total - available. `current_used_bytes`, `current_available_bytes`, `current_utilization_pct`, `current_utilization_including_arc_pct` and `used_excluding_arc_bytes` all come from the latest complete sample, so `current_used_bytes - arc_bytes = used_excluding_arc_bytes`. When the latest ARC size is known and recent, `current_utilization_pct` and `capacity_status` use memory used excluding the ZFS ARC (`current_utilization_basis: "excluding_arc"`, also `arc_bytes`, `used_excluding_arc_bytes`, `utilization_excluding_arc_pct`) and `current_utilization_including_arc_pct` gives the ARC-inclusive figure. Otherwise `current_utilization_basis` is `"including_arc"`. average/peak/trend still include the ARC, and no memory projection is given in that case (`projection_note`), since only the latest ARC size is known. "Recent" means at most 15 minutes older than the newest timestamp in the NAS's own reporting data (the memory graph's latest sample or the graph `end`), so clock skew between the NAS and the MCP host does not matter; if no such timestamp is available the ARC size is used and `arc_freshness_note` says its age could not be checked
   - Time ranges: HOUR, DAY, WEEK, MONTH, YEAR
   - Overall recommendations based on all metrics
 
@@ -127,16 +159,29 @@ This document provides a comprehensive list of all available MCP tools for TrueN
     - Step 7: Preview with dry-run
     - Step 8: Execute installation
 
-- **delete_app** - Remove installed applications
+- **delete_app** - Remove installed applications (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - IMPORTANT: Host-path datasets are NOT deleted (preserved for data safety)
   - Data remains in original locations for manual cleanup
   - Optional removal of container images
   - Supports dry-run mode to preview deletion
   - Returns task ID for tracking deletion progress
 
-- **upgrade_app** - Upgrade an application to a newer version with optional snapshot backup
+- **upgrade_app** - Upgrade an application to a newer version with optional snapshot backup (**destructive**: the app goes offline and migrations may be one-way). The task completes only once the app is RUNNING (`health_timeout_seconds`: integer 0-600, default 60; an app still starting at the deadline fails the task with a message that the upgrade itself succeeded). TrueNAS always stops the app and snapshots its ix-volumes; `snapshot_hostpaths` only requests snapshots of host paths and is not a confirmation that one was taken
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Supports dry-run mode to preview changes before execution
   - Returns a task ID for tracking long-running operations
+
+- **update_app** - Change an installed application's configuration
+  - Write operation (no confirm needed), but advertises `destructiveHint: true` because it replaces the configuration in place
+  - Supports dry-run mode
+
+- **start_app** - Start a stopped application
+  - Supports dry-run mode; returns a task ID for tracking
+
+- **stop_app** - Stop a running application (**destructive**: the service goes offline)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
+  - Supports dry-run mode; returns a task ID for tracking
 
 ## Directory Services
 
@@ -159,12 +204,15 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Use when configuring LDAP with mutual TLS authentication
 
 - **refresh_directory_cache** - Refresh cached user and group data
+  - Write operation: hidden and refused in read-only mode
   - Refreshes cached information from directory service
   - Use after making changes in Active Directory, LDAP, or IPA
+  - Supports dry-run mode to show the current directory service status first
   - Quick operation, no task tracking needed
 
 ### Write Operations
-- **configure_directory_service** - Configure and join directory service
+- **configure_directory_service** - Configure and join directory service (**destructive**: disabling or re-pointing a joined service cuts off domain users)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Supports Active Directory, LDAP, and FreeIPA/IPA
   - Multiple credential types:
     - **Active Directory**: KERBEROS_USER (username/password) or KERBEROS_PRINCIPAL (principal/keytab)
@@ -190,7 +238,8 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Automatic domain join when enable=true
   - Use enable=false to disable without leaving domain
 
-- **leave_directory_service** - Disconnect from directory service
+- **leave_directory_service** - Disconnect from directory service (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Removes TrueNAS from the domain
   - Deletes computer account from directory (if possible)
   - Removes DNS records
@@ -306,7 +355,8 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Returns a task ID for tracking download progress
   - Does not apply the update (use apply_update after download completes)
 
-- **apply_update** - Apply downloaded TrueNAS system update
+- **apply_update** - Apply downloaded TrueNAS system update (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Applies previously downloaded system update
   - Optional automatic reboot after update (default: false for safety)
   - Supports dry-run mode to preview update actions
@@ -320,7 +370,10 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Displays current system version and available updates
   - Useful for monitoring long-running update operations
 
-- **system_reboot** - Reboot the TrueNAS system
+- **system_reboot** - Reboot the TrueNAS system (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
+  - Supports dry-run mode showing hostname, version and uptime
+  - Optional `delay` in seconds before rebooting, 0-86400 (default: immediately); a pending reboot cannot be cancelled through this server
   - Performs a clean system reboot
   - Disconnects all active sessions and services
   - Use after applying system updates that require a reboot
@@ -333,9 +386,11 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Sort by name, creation date (default), or size
   - Shows which are active/activated/protected/deletable
   - Displays deletion blockers and storage summary
+  - `created` is ISO-8601 UTC (with `created_timestamp` in Unix seconds) when the server's value parses to a time between 2000-01-01 and 10 years from now; any other value is shown raw with `created_timestamp` 0
   - Perfect for "what old boot environments can I clean up?"
 
-- **delete_boot_environment** - Delete a boot environment
+- **delete_boot_environment** - Delete a boot environment (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Dry-run mode shows what will be deleted and space freed
   - Safety checks prevent deleting active/activated/protected
   - Recommends keeping 2-3 boot environments for recovery
@@ -374,7 +429,8 @@ This document provides a comprehensive list of all available MCP tools for TrueN
   - Integrates with task manager for monitoring
   - Use before backups or after hardware changes
 
-- **delete_scrub_schedule** - Remove scrub schedule
+- **delete_scrub_schedule** - Remove scrub schedule (**destructive**)
+  - **Requires `confirm: true`** to execute; without it returns a preview and changes nothing
   - Dry-run shows what will be removed
   - Warns about loss of automatic scrubbing
   - Recommends manual scrub frequency
