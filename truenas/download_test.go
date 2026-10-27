@@ -60,6 +60,14 @@ func newDownloadFake(t *testing.T, download http.HandlerFunc, reply func(downloa
 	return client
 }
 
+// middlewareError mimics a TrueNAS call error, including its bulky trace.
+func middlewareError(errno int, errname, reason, class string) map[string]interface{} {
+	return map[string]interface{}{"code": -32001, "message": "Method call error", "data": map[string]interface{}{
+		"error": errno, "errname": errname, "reason": reason,
+		"trace": map[string]interface{}{"class": class, "formatted": "Traceback ...", "frames": []interface{}{map[string]interface{}{"locals": "<object at 0x1>"}}, "repr": class + "()"},
+	}}
+}
+
 func downloadRPCError(reason string) map[string]interface{} {
 	return map[string]interface{}{"code": -32001, "message": "Method call error", "data": map[string]interface{}{"error": 2, "reason": reason}}
 }

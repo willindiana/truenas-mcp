@@ -8,7 +8,11 @@ import (
 )
 
 func TestJobLogs(t *testing.T) {
-	for _, mode := range []string{"ok", "external", "redirect", "oversize", "missing"} {
+	wantErr := map[string]string{
+		"no-logs":   "job 42 logs unavailable: [EFAULT] This job has no logs",
+		"not-found": "job 42 not found (it may have expired from job history)",
+	}
+	for _, mode := range []string{"ok", "external", "redirect", "oversize", "no-logs", "not-found"} {
 		t.Run(mode, func(t *testing.T) {
 			client := newDownloadFake(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != "/_download/1" {
@@ -36,8 +40,10 @@ func TestJobLogs(t *testing.T) {
 				switch mode {
 				case "external":
 					return "https://example.com/_download/1?auth_token=secret-token", nil
-				case "missing":
-					return nil, downloadRPCError("This job has no logs")
+				case "no-logs":
+					return nil, middlewareError(14, "EFAULT", "This job has no logs", "CallError")
+				case "not-found":
+					return nil, middlewareError(22, "EINVAL", "42", "KeyError")
 				}
 				return "/_download/1?auth_token=secret-token", nil
 			})
@@ -45,6 +51,10 @@ func TestJobLogs(t *testing.T) {
 			if mode == "ok" {
 				if err != nil || string(data) != "first\nlast\n" {
 					t.Fatalf("data=%q err=%v", data, err)
+				}
+			} else if want, ok := wantErr[mode]; ok {
+				if err == nil || err.Error() != want {
+					t.Fatalf("error = %v, want %q", err, want)
 				}
 			} else if err == nil || strings.Contains(err.Error(), "secret-token") {
 				t.Fatalf("unsafe or missing error: %v", err)

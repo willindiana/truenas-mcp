@@ -2,6 +2,7 @@ package truenas
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,13 +19,29 @@ func (c *Client) JobLogs(id int) ([]byte, error) {
 	}
 	raw, err := c.Call("core.job_download_logs", id, "job.log", false)
 	if err != nil {
-		return nil, fmt.Errorf("job logs unavailable (job may have expired or have no logs): %w", err)
+		return nil, jobLogsError(id, err)
 	}
 	var path string
 	if json.Unmarshal(raw, &path) != nil {
 		return nil, fmt.Errorf("invalid job log download response")
 	}
 	return c.downloadLog(path)
+}
+
+// jobLogsError keeps only the server's message; the middleware trace is
+// kilobytes of stack frames. An unknown job id surfaces as a KeyError.
+func jobLogsError(id int, err error) error {
+	var apiErr *APICallError
+	if !errors.As(err, &apiErr) {
+		return fmt.Errorf("job %d logs unavailable: %w", id, err)
+	}
+	var trace struct {
+		Class string `json:"class"`
+	}
+	if json.Unmarshal([]byte(apiErr.Trace), &trace) == nil && trace.Class == "KeyError" {
+		return fmt.Errorf("job %d not found (it may have expired from job history)", id)
+	}
+	return fmt.Errorf("job %d logs unavailable: %s", id, apiErr.Message)
 }
 
 // downloadLog accepts only same-host download paths and never returns token-bearing errors.
